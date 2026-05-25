@@ -26,6 +26,7 @@ import { registerNodeManagementTools } from "./node-management.js";
 import { registerWorkflowDepsTools } from "./workflow-deps.js";
 import { registerInstallComfyUITools } from "./install-comfyui.js";
 import { registerUpdateComfyUITools } from "./update-comfyui.js";
+import { registerWorkspaceEnvTools } from "./workspace-env.js";
 import { DefaultsManager } from "../services/defaults-manager.js";
 
 export async function registerAllTools(server: McpServer): Promise<void> {
@@ -58,5 +59,6 @@ export async function registerAllTools(server: McpServer): Promise<void> {
   registerInstallComfyUITools(server);
   registerUpdateComfyUITools(server);
   registerModelExtrasTools(server);
+  registerWorkspaceEnvTools(server);
   await registerAutoloadedWorkflows(server);
 }
