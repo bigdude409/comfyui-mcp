@@ -21,6 +21,7 @@ import { registerConditionedGenerationTools } from "./generate-conditioned.js";
 import { registerWorkflowDslTools } from "./workflow-dsl.js";
 import { registerNodeSnapshotsTools } from "./node-snapshots.js";
 import { registerNodeBisectTools } from "./node-bisect.js";
+import { registerNodeManagementTools } from "./node-management.js";
 import { DefaultsManager } from "../services/defaults-manager.js";
 
 export async function registerAllTools(server: McpServer): Promise<void> {
@@ -48,5 +49,6 @@ export async function registerAllTools(server: McpServer): Promise<void> {
   registerWorkflowDslTools(server);
   registerNodeSnapshotsTools(server);
   registerNodeBisectTools(server);
+  registerNodeManagementTools(server);
   await registerAutoloadedWorkflows(server);
 }
