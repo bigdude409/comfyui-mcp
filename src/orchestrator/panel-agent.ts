@@ -22,11 +22,12 @@ import type {
   SDKUserMessage,
   Options,
   ModelInfo,
+  SlashCommand,
   McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
 import { logger } from "../utils/logger.js";
 
-export type { ModelInfo };
+export type { ModelInfo, SlashCommand };
 
 // The Agent SDK is an OPTIONAL dependency (it pulls in ~100 packages and is only
 // needed for the panel orchestrator), so load it lazily and fail with a clear
@@ -123,6 +124,70 @@ export async function fetchSupportedModels(model: string): Promise<ModelInfo[]> 
   }
 }
 
+/**
+ * Probe the SDK for the slash commands this account/session exposes (built-ins
+ * like /compact, plus any loaded skills) so the panel can surface them in the
+ * composer's completion menu. Same throwaway-session pattern as
+ * fetchSupportedModels; returns [] on any failure so the panel degrades cleanly.
+ */
+export async function fetchSupportedCommands(model: string): Promise<SlashCommand[]> {
+  const query = await loadQuery();
+  let stop = false;
+  let wake: (() => void) | null = null;
+  async function* idle(): AsyncGenerator<SDKUserMessage> {
+    while (!stop) {
+      await new Promise<void>((resolve) => {
+        wake = resolve;
+      });
+    }
+  }
+  const q = query({
+    prompt: idle(),
+    options: {
+      model,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      strictMcpConfig: true,
+      mcpServers: {},
+    } as Options,
+  });
+  const drain = (async () => {
+    try {
+      for await (const _ of q) {
+        void _;
+      }
+    } catch {
+      // torn down below
+    }
+  })();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const commands = await Promise.race([
+      q.supportedCommands(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("supportedCommands timed out")), 20000);
+      }),
+    ]);
+    logger.info(
+      `[panel-orchestrator] supportedCommands: ${commands.map((c) => "/" + c.name).join(", ") || "(none)"}`,
+    );
+    return commands;
+  } catch (err) {
+    logger.warn(`[panel-orchestrator] supportedCommands probe failed: ${msgOf(err)}`);
+    return [];
+  } finally {
+    if (timer) clearTimeout(timer);
+    stop = true;
+    (wake as (() => void) | null)?.();
+    try {
+      await q.interrupt();
+    } catch {
+      // already winding down
+    }
+    void drain;
+  }
+}
+
 /** Reasoning effort levels the SDK accepts (passed via Options.effort). */
 export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
 export const EFFORTS: Effort[] = ["low", "medium", "high", "xhigh", "max"];
@@ -200,6 +265,10 @@ export interface PanelAgentDeps {
   onTurn?: (tabId: string, state: "working" | "done") => void;
   /** Live extended-thinking token count, for a "thinking… (N)" indicator. */
   onThinking?: (tabId: string, tokens: number) => void;
+  /** Fired when the agent DEQUEUES a message and starts processing it (the true
+   *  "read" moment) — carries the client mid so the panel can flip that bubble
+   *  from queued/muted to read. */
+  onSeen?: (tabId: string, mid: string) => void;
   /** In-process MCP server giving the agent LIVE control of this tab's graph. */
   panelServer?: McpSdkServerConfigWithInstance;
   /**
@@ -219,13 +288,24 @@ export class PanelAgent {
   readonly tabId: string;
   private deps: PanelAgentDeps;
   private q: Query | null = null;
-  private queue: Array<{ text: string; images?: ImageRef[] }> = [];
+  private queue: Array<{ text: string; images?: ImageRef[]; mid?: string }> = [];
   private waiting: (() => void) | null = null;
   private closed = false;
   /** True while a turn is in flight (working→done). Lets the manager defer a
    *  session-restarting option change (effort) until the turn finishes, instead
    *  of interrupting and silently dropping the in-flight reply. */
   private busy = false;
+  // ---- turn gate (race-free) ----
+  // The channel releases ONE batch per turn so the SDK can't read ahead (which
+  // prematurely "read" queued messages and lost them on interrupt). Implemented
+  // with MONOTONIC COUNTERS, not a resolver: after yielding batch N the channel
+  // waits until completedTurns >= yieldedTurns. This is deadlock-proof — if the
+  // turn's result fires BEFORE the channel parks, the counter has already caught
+  // up and the channel never blocks (the resolver version deadlocked on that
+  // race, stranding every later message).
+  private yieldedTurns = 0;
+  private completedTurns = 0;
+  private turnWaiter: (() => void) | null = null;
   /** Mutable so the model/effort picker can change them at runtime. */
   private model: string;
   private effort?: Effort;
@@ -257,12 +337,22 @@ export class PanelAgent {
 
   /** Queue a panel message and wake the streaming generator (the "channel in").
    *  `images` are ComfyUI refs delivered inline as image blocks (vision). */
-  send(text: string, opts?: { title?: string; images?: ImageRef[] }): void {
+  send(text: string, opts?: { title?: string; images?: ImageRef[]; mid?: string }): void {
     if (opts?.title) this.title = opts.title;
-    this.queue.push({ text, images: opts?.images });
+    this.queue.push({ text, images: opts?.images, mid: opts?.mid });
     const wake = this.waiting;
     this.waiting = null;
     wake?.();
+  }
+
+  /** Drop a still-queued message (the user cancelled/edited it before the agent
+   *  got to it). Returns true if it was found and removed; false if it was
+   *  already dequeued (the turn started — too late to cancel). */
+  cancelQueued(mid: string): boolean {
+    const i = this.queue.findIndex((item) => item.mid === mid);
+    if (i < 0) return false;
+    this.queue.splice(i, 1);
+    return true;
   }
 
   /**
@@ -375,12 +465,16 @@ export class PanelAgent {
     return this.effort;
   }
 
-  /** Stop the current turn without ending the session (a "stop" button). */
+  /** Stop the current turn without ending the session (a "stop" button). The
+   *  turn ends → release the next queued message so an interrupt ADVANCES to the
+   *  next pending turn (and only stops cold when nothing is queued). */
   async interrupt(): Promise<void> {
     try {
       await this.q?.interrupt();
     } catch (err) {
       logger.debug(`[panel-agent ${this.short()}] interrupt: ${msgOf(err)}`);
+    } finally {
+      this.releaseTurns();
     }
   }
 
@@ -390,6 +484,7 @@ export class PanelAgent {
     const wake = this.waiting;
     this.waiting = null;
     wake?.(); // let the generator observe `closed` and return
+    this.releaseTurns(); // and unblock it if it's parked at the turn gate
     try {
       await this.q?.interrupt();
     } catch {
@@ -397,36 +492,79 @@ export class PanelAgent {
     }
   }
 
+  /** A turn finished (result) → let the channel release the next batch. Capped at
+   *  yieldedTurns so an interrupt + a late result for the same turn can't double-
+   *  count and let the gate run ahead. */
+  private completeTurn(): void {
+    this.completedTurns = Math.min(this.completedTurns + 1, this.yieldedTurns);
+    const w = this.turnWaiter;
+    this.turnWaiter = null;
+    w?.();
+  }
+
+  /** Force the gate open regardless of results (interrupt / shutdown) so an
+   *  interrupt advances to the next pending batch instead of stopping cold. */
+  private releaseTurns(): void {
+    this.completedTurns = this.yieldedTurns;
+    const w = this.turnWaiter;
+    this.turnWaiter = null;
+    w?.();
+  }
+
   // The streaming "channel in": an async generator that stays open and yields a
   // user turn whenever the panel sends one. The session idles between messages
   // and wakes the moment send() pushes — solving "can't wake an idle session".
+  // ONE batch is released per turn (counter gate) so the SDK can't read ahead.
   private async *channel(): AsyncGenerator<SDKUserMessage> {
     while (!this.closed) {
       if (this.queue.length === 0) {
+        // Idle & settled (we only reach here after the prior turn's gate opened):
+        // reset the counters to 0. Keeps them small and SELF-HEALS any drift a
+        // post-interrupt stray result may have introduced during a busy burst.
+        this.yieldedTurns = 0;
+        this.completedTurns = 0;
         await new Promise<void>((resolve) => {
           this.waiting = resolve;
         });
       }
       if (this.closed) return;
-      const item = this.queue.shift();
-      if (item === undefined) continue;
-      // Resolve any image refs to inline base64 blocks so the agent SEES the
-      // image in this turn (no view_image/get_image round-trip).
-      let content: unknown = item.text;
-      if (item.images?.length) {
+      // Drain the WHOLE queue into ONE turn — rapid-fire follow-ups are handled
+      // together (I see them all and reply once) rather than one-per-turn. Each
+      // message is now actually being taken off the queue: fire onSeen for every
+      // mid so all their bubbles flip from queued/muted to read at once.
+      const batch = this.queue.splice(0, this.queue.length);
+      if (batch.length === 0) continue;
+      for (const it of batch) {
+        if (it.mid) this.deps.onSeen?.(this.tabId, it.mid);
+      }
+      const text = batch.map((it) => it.text).join("\n\n");
+      const images = batch.flatMap((it) => it.images ?? []);
+      // Resolve image refs to inline base64 blocks so the agent SEES them in this
+      // turn (no view_image/get_image round-trip).
+      let content: unknown = text;
+      if (images.length) {
         const blocks: unknown[] = [];
-        for (const ref of item.images) {
+        for (const ref of images) {
           const b = await this.fetchImageBlock(ref);
           if (b) blocks.push(b);
         }
-        if (blocks.length) content = [{ type: "text", text: item.text }, ...blocks];
+        if (blocks.length) content = [{ type: "text", text }, ...blocks];
       }
       if (this.closed) return;
+      this.yieldedTurns += 1; // this batch is turn N
       yield {
         type: "user",
         message: { role: "user", content } as SDKUserMessage["message"],
         parent_tool_use_id: null,
       };
+      // Hold the next batch until THIS turn completes. Race-free: if the result
+      // already fired (completedTurns caught up) we don't park at all, so the
+      // channel can never deadlock and strand later messages.
+      while (!this.closed && this.completedTurns < this.yieldedTurns) {
+        await new Promise<void>((resolve) => {
+          this.turnWaiter = resolve;
+        });
+      }
     }
   }
 
@@ -485,6 +623,11 @@ export class PanelAgent {
     while (!this.closed) {
       const resume = this.sessionId ?? resumeSessionId;
       const startedAt = Date.now();
+      // Fresh channel → reset the turn-gate counters so a restart/resume never
+      // inherits a stale offset that would mis-gate the first batch.
+      this.yieldedTurns = 0;
+      this.completedTurns = 0;
+      this.turnWaiter = null;
       this.q = query({ prompt: this.channel(), options: this.buildOptions(resume) });
       try {
         for await (const message of this.q) this.route(message);
@@ -605,6 +748,7 @@ export class PanelAgent {
         }
         if (this.lastUsage) this.reportStatus(this.lastUsage, m.total_cost_usd);
         this.busy = false;
+        this.completeTurn(); // turn finished → release the next queued batch
         this.deps.onTurn?.(this.tabId, "done");
         logger.info(
           `[panel-agent ${this.short()}] turn done (subtype=${message.subtype})`,
@@ -657,6 +801,8 @@ export interface PanelAgentManagerOptions {
   onTurn?: (tabId: string, state: "working" | "done") => void;
   /** Live extended-thinking token count, for a "thinking… (N)" indicator. */
   onThinking?: (tabId: string, tokens: number) => void;
+  /** Fired when the agent dequeues a message (read moment) — carries the mid. */
+  onSeen?: (tabId: string, mid: string) => void;
   /** Build the per-tab live-graph MCP server (bound to the tab id). */
   makePanelServer?: (tabId: string) => McpSdkServerConfigWithInstance;
   /** Bundled plugin dir whose skills make the agent an expert (optional). */
@@ -700,9 +846,16 @@ export class PanelAgentManager {
         if (state === "done") this.applyDeferredRestart(id);
       },
       onThinking: this.opts.onThinking,
+      onSeen: this.opts.onSeen,
       panelServer: this.opts.makePanelServer?.(tabId),
       pluginPath: this.opts.pluginPath,
     });
+  }
+
+  /** Cancel a still-queued message for a tab (user edited/deleted it before the
+   *  agent read it). Returns true if it was removed from the queue. */
+  cancelQueued(tabId: string, mid: string): boolean {
+    return this.agents.get(tabId)?.cancelQueued(mid) ?? false;
   }
 
   /** Effort is a session-construction option (no live setter), so changing it
@@ -787,7 +940,7 @@ export class PanelAgentManager {
   /** Route a panel message to its tab's agent, creating the agent if needed.
    *  Never routes into a stopped agent (whose channel is closed) — respawns so
    *  the message reaches a live session. */
-  send(tabId: string, text: string, meta?: { title?: string; images?: ImageRef[] }): void {
+  send(tabId: string, text: string, meta?: { title?: string; images?: ImageRef[]; mid?: string }): void {
     let agent = this.agents.get(tabId);
     if (agent?.isStopped) {
       this.agents.delete(tabId);
@@ -798,7 +951,7 @@ export class PanelAgentManager {
       this.pendingResume.delete(tabId);
       agent = this.spawn(tabId, resume);
     }
-    agent.send(text, { title: meta?.title, images: meta?.images });
+    agent.send(text, { title: meta?.title, images: meta?.images, mid: meta?.mid });
   }
 
   /**

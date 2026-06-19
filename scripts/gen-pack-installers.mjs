@@ -50,14 +50,18 @@ function genBat(pack, manifest) {
   L.push('if not exist "custom_nodes" ( echo [ERROR] Run from your ComfyUI root ^(custom_nodes\\ not found^). & pause & exit /b 1 )');
   L.push('where git >nul 2>&1 || ( echo [ERROR] git not found in PATH. & pause & exit /b 1 )');
   L.push('where curl >nul 2>&1 || ( echo [ERROR] curl not found in PATH. & pause & exit /b 1 )');
+  L.push("rem Resolve the ComfyUI python: venv first, then portable embed, then PATH python.");
+  L.push('set "PY=%CD%\\.venv\\Scripts\\python.exe"');
+  L.push('if not exist "%PY%" set "PY=%CD%\\venv\\Scripts\\python.exe"');
+  L.push('if not exist "%PY%" set "PY=%CD%\\..\\python_embeded\\python.exe"');
+  L.push('if not exist "%PY%" set "PY=python"');
+  L.push('echo using python: %PY%');
   L.push("");
   L.push("echo -------- custom nodes --------");
   for (const url of nodes) L.push(`call :clone "${repoFolder(url)}" "${url}"`);
   if (pip.length) {
     L.push("");
-    L.push("echo -------- pip --------");
-    L.push('set "PY=%CD%\\..\\python_embeded\\python.exe"');
-    L.push('if not exist "%PY%" set "PY=python"');
+    L.push("echo -------- pip (manifest extras) --------");
     for (const p of pip) L.push(`"%PY%" -m pip install "${p}"`);
   }
   L.push("");
@@ -69,7 +73,11 @@ function genBat(pack, manifest) {
   L.push("exit /b");
   L.push("");
   L.push(":clone");
-  L.push('if not exist "custom_nodes\\%~1" ( echo   cloning %~1 & git clone --depth 1 "%~2" "custom_nodes\\%~1" ) else ( echo   %~1 present - skip )');
+  L.push('if not exist "custom_nodes\\%~1" (');
+  L.push("  echo   cloning %~1");
+  L.push('  git clone --depth 1 "%~2" "custom_nodes\\%~1"');
+  L.push('  if exist "custom_nodes\\%~1\\requirements.txt" ( echo   installing %~1 requirements.txt & "%PY%" -m pip install -r "custom_nodes\\%~1\\requirements.txt" )');
+  L.push(") else ( echo   %~1 present - skip )");
   L.push("goto :eof");
   L.push("");
   L.push(":grab");
@@ -91,9 +99,20 @@ function genSh(pack, manifest) {
   L.push(`# Pack: ${pack.display_name || pack.name}  (Linux / RunPod)`);
   L.push("# Run from your ComfyUI root (the folder containing custom_nodes/ and models/).");
   L.push('[ -d custom_nodes ] || { echo "[ERROR] run from your ComfyUI root (custom_nodes/ not found)"; exit 1; }');
+  L.push("# Resolve the ComfyUI python: its venv first, then portable embed, then \\$PYTHON/python3.");
+  L.push('# Installing requirements into the wrong interpreter is why nodes silently fail to load.');
+  L.push('if [ -n "${PYTHON:-}" ]; then PY="$PYTHON";');
+  L.push('elif [ -x ".venv/bin/python" ]; then PY=".venv/bin/python";');
+  L.push('elif [ -x "venv/bin/python" ]; then PY="venv/bin/python";');
+  L.push('elif [ -x "../python_embeded/python" ]; then PY="../python_embeded/python";');
+  L.push('else PY="python3"; fi');
+  L.push('echo "using python: $PY"');
   L.push("");
   L.push("clone() { # folder url");
-  L.push('  if [ ! -d "custom_nodes/$1" ]; then echo "  cloning $1"; git clone --depth 1 "$2" "custom_nodes/$1"; else echo "  $1 present - skip"; fi');
+  L.push('  if [ ! -d "custom_nodes/$1" ]; then');
+  L.push('    echo "  cloning $1"; git clone --depth 1 "$2" "custom_nodes/$1"');
+  L.push('    if [ -f "custom_nodes/$1/requirements.txt" ]; then echo "  installing $1 requirements.txt"; "$PY" -m pip install -r "custom_nodes/$1/requirements.txt"; fi');
+  L.push('  else echo "  $1 present - skip"; fi');
   L.push("}");
   L.push("grab() { # relpath url");
   L.push('  mkdir -p "$(dirname "$1")"');
@@ -104,8 +123,7 @@ function genSh(pack, manifest) {
   for (const url of nodes) L.push(`clone "${repoFolder(url)}" "${url}"`);
   if (pip.length) {
     L.push("");
-    L.push('echo "-------- pip --------"');
-    L.push('PY="${PYTHON:-python3}"');
+    L.push('echo "-------- pip (manifest extras) --------"');
     for (const p of pip) L.push(`"$PY" -m pip install "${p}"`);
   }
   L.push("");

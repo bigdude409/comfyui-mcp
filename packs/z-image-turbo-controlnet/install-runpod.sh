@@ -4,9 +4,20 @@ set -euo pipefail
 # Pack: Z-Image-Turbo — ControlNet (Pose / Depth / Canny)  (Linux / RunPod)
 # Run from your ComfyUI root (the folder containing custom_nodes/ and models/).
 [ -d custom_nodes ] || { echo "[ERROR] run from your ComfyUI root (custom_nodes/ not found)"; exit 1; }
+# Resolve the ComfyUI python: its venv first, then portable embed, then \$PYTHON/python3.
+# Installing requirements into the wrong interpreter is why nodes silently fail to load.
+if [ -n "${PYTHON:-}" ]; then PY="$PYTHON";
+elif [ -x ".venv/bin/python" ]; then PY=".venv/bin/python";
+elif [ -x "venv/bin/python" ]; then PY="venv/bin/python";
+elif [ -x "../python_embeded/python" ]; then PY="../python_embeded/python";
+else PY="python3"; fi
+echo "using python: $PY"
 
 clone() { # folder url
-  if [ ! -d "custom_nodes/$1" ]; then echo "  cloning $1"; git clone --depth 1 "$2" "custom_nodes/$1"; else echo "  $1 present - skip"; fi
+  if [ ! -d "custom_nodes/$1" ]; then
+    echo "  cloning $1"; git clone --depth 1 "$2" "custom_nodes/$1"
+    if [ -f "custom_nodes/$1/requirements.txt" ]; then echo "  installing $1 requirements.txt"; "$PY" -m pip install -r "custom_nodes/$1/requirements.txt"; fi
+  else echo "  $1 present - skip"; fi
 }
 grab() { # relpath url
   mkdir -p "$(dirname "$1")"
@@ -28,9 +39,9 @@ clone "SeedVarianceEnhancer" "https://github.com/ChangeTheConstants/SeedVariance
 clone "ComfyUI-Detail-Daemon" "https://github.com/Jonseed/ComfyUI-Detail-Daemon"
 clone "comfyui_controlnet_aux" "https://github.com/Fannovel16/comfyui_controlnet_aux"
 
-echo "-------- pip --------"
-PY="${PYTHON:-python3}"
+echo "-------- pip (manifest extras) --------"
 "$PY" -m pip install "librosa"
+"$PY" -m pip install "scikit-image"
 
 echo "-------- models --------"
 grab "models/unet/z_image_turbo-Q8_0.gguf" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/z_image_turbo-Q8_0.gguf"

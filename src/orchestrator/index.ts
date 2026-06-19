@@ -9,7 +9,7 @@
 // panel-agent.ts). Each agent runs on the user's Claude SUBSCRIPTION with no API
 // key. See docs/design/panel-orchestrator.md.
 
-import { existsSync, writeFileSync, unlinkSync, readFileSync } from "node:fs";
+import { existsSync, writeFileSync, unlinkSync, readFileSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,9 +19,11 @@ import { logger } from "../utils/logger.js";
 import {
   PanelAgentManager,
   fetchSupportedModels,
+  fetchSupportedCommands,
   isEffort,
   type Effort,
   type ModelInfo,
+  type SlashCommand,
   type UsageStatus,
 } from "./panel-agent.js";
 import { createPanelMcpServer } from "./panel-tools.js";
@@ -188,6 +190,13 @@ export async function runPanelOrchestrator(): Promise<void> {
       lockPath,
       JSON.stringify({
         pid: process.pid,
+        // Our OWN process creation time, captured now while we KNOW this pid is
+        // the real orchestrator. The pack matches a live pid's creation time
+        // against this before ever killing it, so a reused pid (a shell, node,
+        // anything that inherits our old pid) can't be mistaken for us and
+        // terminated — the TOCTOU pid-reuse guard. Null on platforms we can't
+        // read it (the pack then falls back to the cmdline identity check).
+        pidStartedAt: readProcessStartedAtMs(process.pid),
         parent: Number(process.env.COMFYUI_MCP_PARENT_PID) || null,
         parentStartedAt: Number(process.env.COMFYUI_MCP_PARENT_STARTED_AT_MS) || null,
         port: lockPort,
@@ -211,6 +220,11 @@ export async function runPanelOrchestrator(): Promise<void> {
   const envEffort = process.env.COMFYUI_MCP_PANEL_EFFORT;
   const effort: Effort | undefined = isEffort(envEffort) ? envEffort : undefined;
   const bridgePort = Number(process.env.COMFYUI_MCP_BRIDGE_PORT) || 9180;
+
+  // Cross-process download-progress channel: each tab's comfyui MCP subprocess
+  // writes per-download JSON here; the watcher below broadcasts it to the panel
+  // tray. Port-scoped so parallel orchestrators don't cross streams.
+  const progressDir = join(tmpdir(), `comfyui-mcp-progress-${bridgePort}`);
 
   // The bundled plugin (skills) ships alongside dist/ in the package root. Load
   // it so the background agents are ComfyUI experts out of the box.
@@ -269,6 +283,8 @@ export async function runPanelOrchestrator(): Promise<void> {
         args: [mcpEntry], // dist/index.js
         env: {
           COMFYUI_URL: comfyuiUrl,
+          // Where download_model writes live progress for the panel tray.
+          COMFYUI_MCP_PROGRESS_DIR: progressDir,
           // Local mode → enables download_model, apply_manifest (installer packs),
           // and model scans so the agent installs the right way instead of curl.
           ...(comfyuiPath ? { COMFYUI_PATH: comfyuiPath } : {}),
@@ -298,6 +314,11 @@ export async function runPanelOrchestrator(): Promise<void> {
     // Live extended-thinking token count → "thinking… (N)" indicator.
     onThinking: (tabId, tokens) => {
       bridge.push({ type: "thinking", tokens }, tabId);
+    },
+    // The agent dequeued a message (the true "read" moment) → flip that bubble
+    // from queued/muted to read.
+    onSeen: (tabId, mid) => {
+      bridge.push({ type: "ack", ok: true, kind: "seen", mid }, tabId);
     },
   });
 
@@ -333,6 +354,33 @@ export async function runPanelOrchestrator(): Promise<void> {
       });
   }
 
+  // The SDK's slash commands (built-ins like /compact, plus any loaded skills) —
+  // probed once and surfaced in the panel composer's completion menu.
+  let commandsPromise: Promise<SlashCommand[]> | null = null;
+  function ensureCommands(): Promise<SlashCommand[]> {
+    if (!commandsPromise) {
+      commandsPromise = fetchSupportedCommands(model).then((list) => {
+        if (!list.length) commandsPromise = null; // let the next hello retry
+        return list;
+      });
+    }
+    return commandsPromise;
+  }
+  // The SDK reports EVERY command the user's Claude install exposes — including
+  // all their unrelated skills/plugins (Cloudflare, codex:*, etc.). Surface only
+  // the built-ins that make sense inside the ComfyUI panel chat.
+  const PANEL_SLASH_ALLOWLIST = new Set(["compact", "context", "usage", "loop", "goal", "clear"]);
+  function pushCommands(tabId: string): void {
+    void ensureCommands()
+      .then((commands) => {
+        const useful = commands.filter((c) => PANEL_SLASH_ALLOWLIST.has(c.name));
+        if (useful.length) bridge.push({ type: "commands", commands: useful }, tabId);
+      })
+      .catch(() => {
+        /* probe already logged; panel just won't show SDK commands */
+      });
+  }
+
   bridge.onPanelMessage = (event) => {
     // Connect ack: the instant a panel tab connects, the orchestrator announces
     // itself so "connected" means "a real agent is attending" — not merely "a
@@ -343,8 +391,10 @@ export async function runPanelOrchestrator(): Promise<void> {
       // agent's memory continues. Only honored before the tab's agent spawns.
       const resume = typeof event.resume === "string" ? event.resume : undefined;
       if (resume) manager.setResume(event.tab_id, resume);
-      // Send the live model list so the picker reflects the real subscription.
+      // Send the live model list so the picker reflects the real subscription,
+      // and the SDK's slash commands so the composer can surface them.
       pushModels(event.tab_id);
+      pushCommands(event.tab_id);
       // Re-push the last usage so the context meter isn't blank after a reload.
       const lastStatus = manager.lastStatusFor(event.tab_id);
       if (lastStatus) pushStatus(event.tab_id, lastStatus);
@@ -459,6 +509,16 @@ export async function runPanelOrchestrator(): Promise<void> {
       return;
     }
 
+    // The user edited/deleted a still-QUEUED message before the agent read it —
+    // drop it from the agent's queue so it's never processed.
+    if (event.type === "cancel_message" && event.tab_id) {
+      const tabId = event.tab_id;
+      const mid = typeof (event as { mid?: unknown }).mid === "string" ? (event as { mid?: string }).mid : undefined;
+      const removed = mid ? manager.cancelQueued(tabId, mid) : false;
+      bridge.push({ type: "ack", ok: true, kind: "cancel_message", mid, removed }, tabId);
+      return;
+    }
+
     // New chat: forget this tab's session so the next message starts fresh (no
     // memory of the prior conversation). Tell the panel to drop its stored id.
     if (event.type === "new_session" && event.tab_id) {
@@ -494,7 +554,9 @@ export async function runPanelOrchestrator(): Promise<void> {
     bridge.push({ type: "echo", text: event.text }, event.tab_id);
     // Per-message ack: a live server-side signal that the agent received this
     // turn and is working — distinct from the panel's own optimistic spinner.
-    bridge.push({ type: "ack", ok: true, kind: "working" }, event.tab_id);
+    // Echo the client mid so the panel can mark that exact bubble delivered.
+    const userMid = typeof (event as { mid?: unknown }).mid === "string" ? (event as { mid?: string }).mid : undefined;
+    bridge.push({ type: "ack", ok: true, kind: "working", ...(userMid ? { mid: userMid } : {}) }, event.tab_id);
     // Show the working indicator immediately (before the first assistant token).
     bridge.push({ type: "turn", state: "working" }, event.tab_id);
     logger.info(
@@ -503,8 +565,65 @@ export async function runPanelOrchestrator(): Promise<void> {
     manager.send(event.tab_id, event.text, {
       title: event.title,
       images: (event as { images?: Array<{ filename: string; subfolder?: string; type?: string }> }).images,
+      mid: userMid,
     });
   };
+
+  // ---- Download-progress watcher ----
+  // Each tab's comfyui MCP (download_model) writes per-download JSON into
+  // progressDir; poll it and broadcast the rows to every panel tab's tray.
+  // Done/error rows linger briefly (so completion is visible), then are pruned;
+  // a downloading row that stops updating for 60s is treated as a dead writer.
+  const DOWNLOAD_LINGER_MS = 8000;
+  const downloadRemoveAt = new Map<string, number>();
+  let lastDownloadSnapshot = "[]";
+  const pollDownloads = () => {
+    let files: string[] = [];
+    try {
+      files = readdirSync(progressDir).filter((f) => f.endsWith(".json"));
+    } catch {
+      files = []; // dir not created yet — nothing downloading
+    }
+    const now = Date.now();
+    const downloads: Array<Record<string, unknown>> = [];
+    for (const f of files) {
+      const full = join(progressDir, f);
+      let row: Record<string, unknown>;
+      try {
+        row = JSON.parse(readFileSync(full, "utf8")) as Record<string, unknown>;
+      } catch {
+        continue; // mid-write or corrupt — retry next tick
+      }
+      if (!row || typeof row !== "object") continue;
+      const status = row.status;
+      const updated = typeof row.updated === "number" ? row.updated : now;
+      if (status === "done" || status === "error") {
+        const due = downloadRemoveAt.get(full);
+        if (due == null) {
+          downloadRemoveAt.set(full, now + DOWNLOAD_LINGER_MS); // start the linger
+        } else if (now >= due) {
+          try { unlinkSync(full); } catch { /* already gone */ }
+          downloadRemoveAt.delete(full);
+          continue; // pruned from the tray
+        }
+      } else {
+        downloadRemoveAt.delete(full);
+        if (now - updated > 60000) {
+          try { unlinkSync(full); } catch { /* ignore */ }
+          continue; // dead writer (crashed mid-download)
+        }
+      }
+      downloads.push(row);
+    }
+    downloads.sort((a, b) => String(a.name ?? "").localeCompare(String(b.name ?? "")));
+    const snapshot = JSON.stringify(downloads);
+    if (snapshot !== lastDownloadSnapshot) {
+      lastDownloadSnapshot = snapshot;
+      bridge.push({ type: "download_progress", downloads }); // broadcast to all tabs
+    }
+  };
+  const downloadTimer = setInterval(pollDownloads, 700);
+  downloadTimer.unref?.();
 
   logger.info(
     `[panel-orchestrator] ready — bridge on ws://127.0.0.1:${bridgePort}; an agent spawns per ComfyUI tab on its first message (model=${model}, comfyui=${comfyuiUrl}${comfyuiPath ? `, path=${comfyuiPath}` : " — no COMFYUI_PATH, local install/pack tools limited"})`,
@@ -515,6 +634,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info("[panel-orchestrator] shutting down — stopping agents…");
+    clearInterval(downloadTimer);
     await manager.stopAll();
     await bridge.stop();
     // Only remove the lockfile if it still names us — avoid clobbering a fresh

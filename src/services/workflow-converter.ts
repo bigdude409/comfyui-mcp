@@ -96,7 +96,128 @@ function getOrderedInputNames(def: ComfyUINodeDef): string[] {
   return names;
 }
 
+// ── De-virtualization (Get/Set/Reroute) pre-pass ────────────────────────────
+
+const WIRING_VIRTUAL_TYPES = new Set([
+  "GetNode", "SetNode", "PRO_GetNode", "PRO_SetNode",
+  "SetNode_GetNode", "SetNode_SetNode",
+]);
+const isGetVirtual = (t: string) => WIRING_VIRTUAL_TYPES.has(t) && /get/i.test(t);
+const isSetVirtual = (t: string) =>
+  WIRING_VIRTUAL_TYPES.has(t) && /set/i.test(t) && !/get/i.test(t);
+const isWiringVirtual = (t: string | undefined) =>
+  t != null && (t === "Reroute" || isGetVirtual(t) || isSetVirtual(t));
+
+/**
+ * Pre-pass: strip the pure "wiring" virtual nodes — KJNodes **Get/Set** bus nodes
+ * and **Reroute** — by rewriting each consumer's link straight to the real
+ * upstream source (following chains, and Get→bus→Set→source). Runs on the
+ * top-level graph AND every subgraph definition, BEFORE expansion, so the
+ * expander and the main converter only ever see real nodes and real links. This
+ * removes the recurring class of dangling-ref bugs where a skipped virtual node
+ * left its consumers (sometimes across a subgraph boundary) pointing at a node
+ * that isn't in the prompt. PrimitiveNode is a value-provider, not a wire, so it
+ * is left for the link loop (which has object_info to map the widget by name).
+ */
+function deVirtualizeGraph(
+  nodes: UiNode[] | undefined,
+  links: unknown[] | undefined,
+): void {
+  if (!nodes?.length || !links?.length) return;
+  const dict = !Array.isArray(links[0]);
+  const lid = (l: any) => (dict ? l.id : l[0]);
+  const lsrc = (l: any) => (dict ? l.origin_id : l[1]);
+  const lsrcSlot = (l: any) => (dict ? l.origin_slot : l[2]);
+  const ltgt = (l: any) => (dict ? l.target_id : l[3]);
+  const setLsrc = (l: any, n: unknown, s: unknown) => {
+    if (dict) { l.origin_id = n; l.origin_slot = s; }
+    else { l[1] = n; l[2] = s; }
+  };
+
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const linkById = new Map((links as any[]).map((l) => [lid(l), l]));
+  const busSet = new Map<string, UiNode>();
+  for (const n of nodes) {
+    if (isSetVirtual(n.type)) {
+      const b = n.widgets_values?.[0];
+      if (b != null) busSet.set(String(b), n);
+    }
+  }
+  const incoming = (node: UiNode) => {
+    const inp = (node.inputs ?? []).find((i) => i.link != null);
+    const l = inp?.link != null ? linkById.get(inp.link) : undefined;
+    return l ? { node: lsrc(l), slot: lsrcSlot(l) } : null;
+  };
+  const resolveReal = (
+    nodeId: unknown,
+    slot: unknown,
+    depth = 0,
+  ): { node: unknown; slot: unknown } | null => {
+    if (depth > 100) return null;
+    const node = byId.get(nodeId as number);
+    if (!node) return { node: nodeId, slot };
+    if (node.type === "Reroute") {
+      const s = incoming(node);
+      return s ? resolveReal(s.node, s.slot, depth + 1) : null;
+    }
+    if (isGetVirtual(node.type)) {
+      const b = node.widgets_values?.[0];
+      const setN = b != null ? busSet.get(String(b)) : undefined;
+      if (!setN) return null;
+      const s = incoming(setN);
+      return s ? resolveReal(s.node, s.slot, depth + 1) : null;
+    }
+    return { node: nodeId, slot };
+  };
+
+  const drop = new Set<unknown>();
+  for (const l of links as any[]) {
+    const srcType = byId.get(lsrc(l))?.type;
+    if (srcType === "Reroute" || (srcType && isGetVirtual(srcType))) {
+      const real = resolveReal(lsrc(l), lsrcSlot(l));
+      if (real && !isWiringVirtual(byId.get(real.node as number)?.type)) {
+        setLsrc(l, real.node, real.slot);
+      } else {
+        drop.add(lid(l)); // unresolved bus/reroute — drop like a dead link
+      }
+    }
+  }
+  const keptLinks = (links as any[]).filter((l) => {
+    if (drop.has(lid(l))) return false;
+    if (isWiringVirtual(byId.get(ltgt(l))?.type)) return false; // link into a virtual
+    if (isWiringVirtual(byId.get(lsrc(l))?.type)) return false; // still-virtual source
+    return true;
+  });
+  const keptNodes = nodes.filter((n) => !isWiringVirtual(n.type));
+  nodes.length = 0;
+  nodes.push(...keptNodes);
+  links.length = 0;
+  (links as any[]).push(...keptLinks);
+}
+
+/** Strip wiring virtuals from the top-level graph and every subgraph definition. */
+function deVirtualize(ui: UiWorkflow): void {
+  deVirtualizeGraph(ui.nodes, ui.links as unknown[]);
+  for (const sg of ui.definitions?.subgraphs ?? []) {
+    deVirtualizeGraph(sg.nodes, sg.links as unknown[]);
+  }
+}
+
 // ── Component / subgraph expansion ──────────────────────────────────────────
+
+/**
+ * Collect every node `type` referenced by a UI workflow — top-level nodes plus
+ * the internal nodes of every subgraph definition. Used to backfill object_info
+ * for node types missing from the bulk /object_info response.
+ */
+export function collectNodeTypes(ui: UiWorkflow): string[] {
+  const types = new Set<string>();
+  for (const n of ui.nodes ?? []) if (n.type) types.add(n.type);
+  for (const sg of ui.definitions?.subgraphs ?? []) {
+    for (const n of sg.nodes ?? []) if (n.type) types.add(n.type);
+  }
+  return [...types];
+}
 
 interface ExpandResult {
   expanded: UiWorkflow;
@@ -299,6 +420,15 @@ function expandSingleComponent(
         const newId = nextLinkId++;
         linksToAdd.push([newId, srcNodeId, srcSlot, remappedTarget, il.target_slot, il.type]);
 
+        // If the external source is ITSELF a component instance (expanded in a
+        // later iteration), register this new link on its output slot so its own
+        // step-7 output rewiring re-targets it. Without this, an A→B subgraph
+        // edge dangles when B expands before A (A's original output link to B was
+        // removed here, but the replacement isn't on A's output list).
+        const srcNode = outerNodes.find((n) => n.id === srcNodeId);
+        const srcOut = srcNode?.outputs?.[srcSlot];
+        if (srcOut) (srcOut.links ??= []).push(newId);
+
         // Update the cloned inner node's input to point to the new link
         const targetNode = newNodes.find((n) => n.id === remappedTarget);
         if (targetNode?.inputs) {
@@ -340,6 +470,7 @@ function expandSingleComponent(
           break;
         }
       }
+      if (process.env.DEBUG_EXPAND) logger.info(`EXPAND ${sg.name} out '${compOutput.name}' links=${JSON.stringify(compOutput.links)} sgLinkIds=${JSON.stringify(sgOutput.linkIds)} innerSrc=${innerSrcId}`);
       if (innerSrcId == null) continue;
       const remappedSrc = nodeRemap.get(innerSrcId);
       if (remappedSrc == null) continue;
@@ -347,6 +478,7 @@ function expandSingleComponent(
       // Rewire each outer link that consumes this component output
       for (const outerLinkId of compOutput.links) {
         const outerLink = outerLinkMap.get(outerLinkId);
+        if (process.env.DEBUG_EXPAND) logger.info(`  rewire link ${outerLinkId}: ${outerLink ? "found -> tgt "+outerLink[3] : "NOT in outerLinkMap"}`);
         if (!outerLink) continue;
 
         const tgtNodeId = outerLink[3];
@@ -494,8 +626,12 @@ export function convertUiToApi(
   ui: UiWorkflow,
   objectInfo: ObjectInfo,
 ): ConversionResult {
-  // Expand component/subgraph nodes before conversion
-  const { expanded, warnings: expandWarnings } = expandComponents(ui);
+  // Clone (don't mutate the caller's workflow), strip the wiring virtuals
+  // (Get/Set bus + Reroute) so the expander + converter only see real links,
+  // then expand component/subgraph nodes.
+  const cleaned = structuredClone(ui);
+  deVirtualize(cleaned);
+  const { expanded, warnings: expandWarnings } = expandComponents(cleaned);
 
   const workflow: WorkflowJSON = {};
   const warnings: string[] = [...expandWarnings];
@@ -709,10 +845,19 @@ export function convertUiToApi(
     // Map linked inputs from node's inputs array (bypass/mute resolved)
     if (node.inputs) {
       for (const input of node.inputs) {
-        if (input.link != null) {
-          const resolved = resolveSource(input.link);
-          if (resolved) inputs[input.name] = [resolved.id, resolved.slot];
+        if (input.link == null) continue;
+        // A virtual PrimitiveNode feeding a widget input provides a literal value,
+        // not a connection — it's skipped from the prompt, so use its widget value
+        // (e.g. a shared seed/steps PrimitiveNode wired into several samplers).
+        const link = linkMap.get(input.link);
+        const srcNode = link ? nodesById.get(link.sourceNodeId) : undefined;
+        if (srcNode?.type === "PrimitiveNode") {
+          const val = srcNode.widgets_values?.[0];
+          if (val !== undefined) inputs[input.name] = val;
+          continue;
         }
+        const resolved = resolveSource(input.link);
+        if (resolved) inputs[input.name] = [resolved.id, resolved.slot];
       }
     }
 
@@ -746,6 +891,7 @@ export function convertUiToApi(
         typeof val[0] === "string" &&
         !validIds.has(val[0])
       ) {
+        if (process.env.DEBUG_PRUNE) logger.info(`PRUNE: ${(node as {class_type?:string}).class_type}.${name} -> missing ${val[0]}`);
         delete ins[name];
         prunedRefs++;
       }

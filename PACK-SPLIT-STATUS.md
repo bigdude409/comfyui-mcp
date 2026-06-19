@@ -55,18 +55,18 @@ group-toggling.
 | `ltx-2.3-extender` | LTX ULTRA | video extend (audio) | 🟡 | " |
 | `ltx-2.3-extender-no-audio` | LTX EXTENDER | video extend (no audio) | 🟡 | " |
 | `ltx-2.3-xy-plot` | LTX XY-PLOT | LoRA xy-plot grid | 🟡 | " |
-| `ideogram-txt2img` | ideogram | text→image | 🔴 | converts clean, but KJNodes **V3 dynamic-combo** nodes (Ideogram4PromptBuilderKJ, ImageSharpenKJ) reject the flat API form at /prompt validation — needs the V3 structured serialization. Converter now maps the values + prunes dangling subgraph refs (groundwork committed); full V3 execution still pending |
-| `ideogram-img2img` | ideogram | img→image | 🔴 | same V3 dynamic-combo blocker |
-| `anima-txt2img` | anima | text→image | 🟡 | needs ttN seed (tinyterraNodes) + SDXL/detector weights |
-| `anima-img2img` | anima | img→image (controlnet) | 🟡 | + DWPose/DepthAnything (controlnet_aux), AnimaLLLite |
-| `anima-inpaint` | anima | inpaint (controlnet) | 🟡 | + AnimaLLLite |
+| `ideogram-txt2img` | ideogram | text→image | ✅ | **render-verified** — the V3 dynamic-combo `<combo>.<nested>` prefix fix (from the LTX work) unblocked the KJNodes (Ideogram4PromptBuilderKJ, ImageSharpenKJ). Sharp Times-Square selfie matching the shipped prompt |
+| `ideogram-img2img` | ideogram | img→image | ✅ | same V3 fix — render-verified |
+| `anima-txt2img` | anima | text→image | 🟡 | **nodes + models all installed** (Impact-Pack/Subpack via venv, ultralytics, tinyterraNodes, SDXL/detector/SAM weights). Converts 0-dangling now (subgraph A→B edge fix landed). Render still short-circuits: UltimateSDUpscale (inside a subgraph) has misaligned widget values (steps=randomize, denoise=simple) — a widget-index mapping issue for link-fed widgets in subgraph context. Last blocker |
+| `anima-img2img` | anima | img→image (controlnet) | 🟡 | same env set up; same subgraph-output-remapping converter gap |
+| `anima-inpaint` | anima | inpaint (controlnet) | 🟡 | same env set up; same subgraph-output-remapping converter gap |
 | `qwen-image-edit-edit` | qwen-image-edit | instruction edit | ✅ | render-verified — two sample-woman inputs hugged in a rainy forest per the shipped instruction. Installed Crystools + downloaded Qwen-Image-Edit Q8 GGUF + Qwen2.5-VL encoders + VAE + Lightning-4step LoRA |
 | `wan-longer-videos-t2v` | wan-longer-videos | text→video | 🟡 | needs WanVideoWrapper + VHS + Wan 14B |
 | `wan-longer-videos-i2v` | wan-longer-videos | img→video | 🟡 | " |
 | `wan-longer-videos-v2v` | wan-longer-videos | video→video | 🟡 | " |
 | `wan-transparent-img2vid` | wan-transparent | img→transparent video | 🟡 | + BiRefNetRMBG |
-| `z-image-turbo-controlnet` | z-image-turbo | controlnet | 🔴 | `DWPreprocessor` registers individually but is missing from the bulk `/object_info`, so the converter skips it (controlnet_aux quirk) |
-| `z-image-base-controlnet` | z-image-base | controlnet | 🔴 | same `DWPreprocessor` issue |
+| `z-image-turbo-controlnet` | z-image-turbo | controlnet | ✅ | render-verified (DWPose-guided fur-hooded portrait). Two fixes: pinned scikit-image so DWPreprocessor registers (was a silent `skimage` import fail, not an object_info quirk) + top-level PrimitiveNode value resolution so the samplers get steps/step-range (was short-circuiting to a preview) |
+| `z-image-base-controlnet` | z-image-base | controlnet | ✅ | render-verified (DWPose-guided portrait) — same scikit-image + PrimitiveNode fixes; downloaded the Z-Image-Fun-Controlnet-Union-2.1 controlnet model |
 | `wan-animate-character` | wan-animate | v2v character anim | 🔴 | whole WanVideo node suite uninstalled → conversion fails until installed |
 | `z-image-turbo-inpainting` | z-image-turbo | inpaint | 🔴 | corrupt source node `workflow>postiveguid` (no subgraph definition in the monolith) — needs source reconstruction |
 

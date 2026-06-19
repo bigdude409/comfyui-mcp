@@ -4,9 +4,20 @@ set -euo pipefail
 # Pack: LTX-2.3 — LTX-2.3 video extender (no audio)  (Linux / RunPod)
 # Run from your ComfyUI root (the folder containing custom_nodes/ and models/).
 [ -d custom_nodes ] || { echo "[ERROR] run from your ComfyUI root (custom_nodes/ not found)"; exit 1; }
+# Resolve the ComfyUI python: its venv first, then portable embed, then \$PYTHON/python3.
+# Installing requirements into the wrong interpreter is why nodes silently fail to load.
+if [ -n "${PYTHON:-}" ]; then PY="$PYTHON";
+elif [ -x ".venv/bin/python" ]; then PY=".venv/bin/python";
+elif [ -x "venv/bin/python" ]; then PY="venv/bin/python";
+elif [ -x "../python_embeded/python" ]; then PY="../python_embeded/python";
+else PY="python3"; fi
+echo "using python: $PY"
 
 clone() { # folder url
-  if [ ! -d "custom_nodes/$1" ]; then echo "  cloning $1"; git clone --depth 1 "$2" "custom_nodes/$1"; else echo "  $1 present - skip"; fi
+  if [ ! -d "custom_nodes/$1" ]; then
+    echo "  cloning $1"; git clone --depth 1 "$2" "custom_nodes/$1"
+    if [ -f "custom_nodes/$1/requirements.txt" ]; then echo "  installing $1 requirements.txt"; "$PY" -m pip install -r "custom_nodes/$1/requirements.txt"; fi
+  else echo "  $1 present - skip"; fi
 }
 grab() { # relpath url
   mkdir -p "$(dirname "$1")"
