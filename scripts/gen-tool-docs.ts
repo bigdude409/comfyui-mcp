@@ -91,6 +91,7 @@ const CATEGORIES: Array<{
     description: "Enqueue workflows and inspect the queue, jobs, history, and system stats.",
     tools: [
       "enqueue_workflow", "get_system_stats", "get_queue", "get_job_status",
+      "get_queued_workflow", "move_queued_job", "edit_queued_job",
       "cancel_job", "cancel_queued_job", "clear_queue", "get_history", "get_logs",
       "health_check",
     ],
@@ -131,7 +132,8 @@ const CATEGORIES: Array<{
     description: "Search, download, list, and remove models; manage embeddings and VRAM.",
     tools: [
       "search_models", "download_model", "download_civitai_model", "list_local_models",
-      "remove_model", "get_embeddings", "clear_vram",
+      "remove_model", "list_extra_paths", "add_extra_path", "remove_extra_path",
+      "get_embeddings", "clear_vram",
     ],
   },
   {

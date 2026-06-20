@@ -152,12 +152,22 @@ export async function runPanelOrchestrator(): Promise<void> {
   // vanished mid-flight, or an SDK hiccup) must never silently kill it —
   // otherwise the panel goes dead with no explanation. Log and keep running.
   process.on("unhandledRejection", (reason) => {
+    // Benign strays are common here (a fire-and-forget push to a tab that vanished
+    // mid-flight, an SDK hiccup) and must NOT kill the orchestrator — log + continue.
     logger.error(
       `[panel-orchestrator] unhandled rejection (ignored): ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`,
     );
   });
   process.on("uncaughtException", (err) => {
-    logger.error(`[panel-orchestrator] uncaught exception (ignored): ${err.stack ?? err.message}`);
+    // A synchronous uncaught throw leaves the process in an UNDEFINED state. The
+    // old "log + continue" here was a zombie root cause — the orchestrator stayed
+    // alive but broken, so the panel couldn't reconnect and a ComfyUI restart just
+    // reattached to it. Exit so the pack respawns a clean orchestrator (Node's own
+    // default is to crash on uncaughtException anyway).
+    logger.error(
+      `[panel-orchestrator] FATAL uncaught exception — exiting so a fresh orchestrator can take over: ${err.stack ?? err.message}`,
+    );
+    process.exit(1);
   });
 
   // Subscription lane: the background agent must authenticate against the user's
@@ -305,6 +315,11 @@ export async function runPanelOrchestrator(): Promise<void> {
     // Report the SDK session id so the panel can persist it and resume on reload.
     onSession: (tabId, sessionId) => {
       bridge.push({ type: "session", session_id: sessionId }, tabId);
+    },
+    // Per-turn rewind anchor (assistant UUID) → the panel stores it so a later
+    // "rewind conversation to here" can fork the session at that point.
+    onTurnAnchor: (tabId, uuid) => {
+      bridge.push({ type: "turn_anchor", uuid }, tabId);
     },
     // Turn lifecycle → the panel's "working" indicator (stays up through silent
     // tool work; clears on done).
@@ -528,6 +543,31 @@ export async function runPanelOrchestrator(): Promise<void> {
       manager.reset(tabId);
       bridge.push({ type: "session", session_id: null }, tabId);
       bridge.push({ type: "ack", ok: true, kind: "new_session" }, tabId);
+      return;
+    }
+
+    // Rewind the conversation: fork the live session at `anchor` (an assistant
+    // UUID the panel stored from onTurnAnchor) so everything after it is dropped,
+    // optionally continuing with the user's edited `text`. The panel handles the
+    // graph (code) scope locally; this is the conversation scope.
+    if (event.type === "rewind" && event.tab_id) {
+      const tabId = event.tab_id;
+      const anchor = typeof event.anchor === "string" ? event.anchor : null;
+      const ok = manager.rewind(tabId, anchor);
+      bridge.push({ type: "ack", ok, kind: "rewind" }, tabId);
+      logger.info(`[panel-orchestrator] tab ${tabId.slice(0, 8)} rewind (anchor=${anchor ? anchor.slice(0, 8) : "fresh"}, ok=${ok})`);
+      return;
+    }
+
+    // Reorder still-queued messages to the panel's desired flush order.
+    if (event.type === "reorder" && event.tab_id) {
+      const tabId = event.tab_id;
+      const order = Array.isArray((event as { order?: unknown }).order)
+        ? ((event as { order?: unknown[] }).order!.filter((m) => typeof m === "string") as string[])
+        : [];
+      const ok = manager.reorderQueue(tabId, order);
+      bridge.push({ type: "ack", ok, kind: "reorder" }, tabId);
+      logger.info(`[panel-orchestrator] tab ${tabId.slice(0, 8)} reorder queue (${order.length} mids, ok=${ok})`);
       return;
     }
 

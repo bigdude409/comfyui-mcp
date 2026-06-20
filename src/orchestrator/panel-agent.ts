@@ -260,6 +260,10 @@ export interface PanelAgentDeps {
   onStatus?: (tabId: string, status: UsageStatus) => void;
   /** Report the SDK session id once known, so the panel can persist/resume it. */
   onSession?: (tabId: string, sessionId: string) => void;
+  /** Report each turn's ending assistant-message UUID — the anchor the panel
+   *  stores so a later "rewind conversation to here" can fork the session at that
+   *  point (resumeSessionAt + forkSession). */
+  onTurnAnchor?: (tabId: string, uuid: string) => void;
   /** Report turn lifecycle so the panel shows a "working" indicator that stays
    *  up through silent tool work and clears when the turn ends. */
   onTurn?: (tabId: string, state: "working" | "done") => void;
@@ -309,6 +313,12 @@ export class PanelAgent {
   /** Mutable so the model/effort picker can change them at runtime. */
   private model: string;
   private effort?: Effort;
+  /** UUID of the last assistant message seen — reported as the turn anchor on
+   *  result, and used as the resume point when forking (rewind). */
+  private lastAssistantUuid: string | null = null;
+  /** Set by requestRewind() to fork the session on the next (re)start. `anchor`
+   *  is the assistant UUID to resume up to (drop everything after); null = fresh. */
+  private pendingRewind: { anchor: string | null } | null = null;
   /** Captured from the session's init message; enables resume across restarts. */
   sessionId: string | null = null;
   /** Id of the assistant message currently streaming (from message_start), so
@@ -345,6 +355,21 @@ export class PanelAgent {
     wake?.();
   }
 
+  /** Rewind the CONVERSATION: fork the session at `anchor` (an assistant UUID
+   *  reported via onTurnAnchor) so everything after it is dropped from the agent's
+   *  memory, then restart. `anchor` null forks to a fresh session. The edited
+   *  message arrives separately as the next user_message (queued + drained by the
+   *  forked channel). The graph (code) scope is handled panel-side. */
+  requestRewind(anchor: string | null): void {
+    this.pendingRewind = { anchor };
+    if (anchor === null) this.sessionId = null; // fresh fork → don't resume
+    // Break the current stream so start()'s loop re-enters and forks.
+    void this.q?.interrupt().catch(() => {});
+    const wake = this.waiting;
+    this.waiting = null;
+    wake?.();
+  }
+
   /** Drop a still-queued message (the user cancelled/edited it before the agent
    *  got to it). Returns true if it was found and removed; false if it was
    *  already dequeued (the turn started — too late to cancel). */
@@ -353,6 +378,19 @@ export class PanelAgent {
     if (i < 0) return false;
     this.queue.splice(i, 1);
     return true;
+  }
+
+  /** Reorder still-queued messages to match the panel's desired flush order.
+   *  `order` is a list of mids; queued items are sorted by their index in it
+   *  (items not named keep their relative order, after the named ones). Only the
+   *  not-yet-dequeued queue is touched — a turn already in flight is unaffected. */
+  reorderQueue(order: string[]): void {
+    if (!Array.isArray(order) || this.queue.length < 2) return;
+    const rank = new Map(order.map((mid, i) => [mid, i]));
+    const at = (mid?: string) => (mid && rank.has(mid) ? rank.get(mid)! : Number.MAX_SAFE_INTEGER);
+    // Stable sort by desired rank (JS Array.sort is stable), so unnamed items
+    // keep their relative order and trail the explicitly-ordered ones.
+    this.queue.sort((a, b) => at(a.mid) - at(b.mid));
   }
 
   /**
@@ -568,7 +606,14 @@ export class PanelAgent {
     }
   }
 
-  private buildOptions(resume?: string): Options {
+  private buildOptions(resume?: string, rewind?: { anchor: string | null } | null): Options {
+    // Rewind: fork the conversation at the anchor (resume up to that message, then
+    // branch into a new session id) so everything after it is dropped. A null
+    // anchor means "fresh session" (handled by clearing resume below).
+    const rewindOpts =
+      rewind && rewind.anchor
+        ? { resume: this.sessionId ?? resume, resumeSessionAt: rewind.anchor, forkSession: true }
+        : null;
     return {
       model: this.model,
       permissionMode: "bypassPermissions",
@@ -604,7 +649,7 @@ export class PanelAgent {
             skills: "all" as const,
           }
         : {}),
-      ...(resume ? { resume } : {}),
+      ...(rewindOpts ?? (resume ? { resume } : {})),
     } as Options;
   }
 
@@ -621,6 +666,10 @@ export class PanelAgent {
     const query = await loadQuery();
     let quickRestarts = 0;
     while (!this.closed) {
+      // A pending rewind (one-shot) forks the session at its anchor; otherwise
+      // resume normally.
+      const rewind = this.pendingRewind;
+      this.pendingRewind = null;
       const resume = this.sessionId ?? resumeSessionId;
       const startedAt = Date.now();
       // Fresh channel → reset the turn-gate counters so a restart/resume never
@@ -628,7 +677,10 @@ export class PanelAgent {
       this.yieldedTurns = 0;
       this.completedTurns = 0;
       this.turnWaiter = null;
-      this.q = query({ prompt: this.channel(), options: this.buildOptions(resume) });
+      // Drop the prior session's last assistant UUID so a fork can't report a
+      // stale (pre-fork) anchor for the first turn of the new session.
+      this.lastAssistantUuid = null;
+      this.q = query({ prompt: this.channel(), options: this.buildOptions(resume, rewind) });
       try {
         for await (const message of this.q) this.route(message);
       } catch (err) {
@@ -708,6 +760,9 @@ export class PanelAgent {
         // Still working — keep the panel's indicator alive through the turn.
         this.busy = true;
         this.deps.onTurn?.(this.tabId, "working");
+        // Remember this message's UUID — it's the rewind anchor for the turn.
+        const auid = (message as unknown as { uuid?: string }).uuid;
+        if (typeof auid === "string") this.lastAssistantUuid = auid;
         // Each assistant API response carries the CURRENT context size — report
         // it live so the meter updates throughout the turn, not just at the end.
         const u = (message.message as unknown as { usage?: Record<string, number> })?.usage;
@@ -749,6 +804,9 @@ export class PanelAgent {
         if (this.lastUsage) this.reportStatus(this.lastUsage, m.total_cost_usd);
         this.busy = false;
         this.completeTurn(); // turn finished → release the next queued batch
+        // Report this turn's anchor (last assistant UUID) so the panel can later
+        // fork the conversation here for a rewind.
+        if (this.lastAssistantUuid) this.deps.onTurnAnchor?.(this.tabId, this.lastAssistantUuid);
         this.deps.onTurn?.(this.tabId, "done");
         logger.info(
           `[panel-agent ${this.short()}] turn done (subtype=${message.subtype})`,
@@ -798,6 +856,7 @@ export interface PanelAgentManagerOptions {
   onStream?: (tabId: string, ev: StreamDelta) => void;
   onStatus?: (tabId: string, status: UsageStatus) => void;
   onSession?: (tabId: string, sessionId: string) => void;
+  onTurnAnchor?: (tabId: string, uuid: string) => void;
   onTurn?: (tabId: string, state: "working" | "done") => void;
   /** Live extended-thinking token count, for a "thinking… (N)" indicator. */
   onThinking?: (tabId: string, tokens: number) => void;
@@ -839,6 +898,7 @@ export class PanelAgentManager {
       onStream: this.opts.onStream,
       onStatus: this.opts.onStatus,
       onSession: this.opts.onSession,
+      onTurnAnchor: this.opts.onTurnAnchor,
       // Wrap onTurn so the manager learns when a turn ends — the safe point to
       // apply a deferred, session-restarting effort change.
       onTurn: (id, state) => {
@@ -929,6 +989,24 @@ export class PanelAgentManager {
       (err) => settle(err),
     );
     return agent;
+  }
+
+  /** Rewind a tab's conversation: fork the live session at `anchor` (dropping
+   *  everything after). The edited message follows as the next user_message.
+   *  Returns false if no live agent. */
+  rewind(tabId: string, anchor: string | null): boolean {
+    const agent = this.agents.get(tabId);
+    if (!agent || agent.isStopped) return false;
+    agent.requestRewind(anchor);
+    return true;
+  }
+
+  /** Reorder a tab's still-queued messages to the panel's desired flush order. */
+  reorderQueue(tabId: string, order: string[]): boolean {
+    const agent = this.agents.get(tabId);
+    if (!agent || agent.isStopped) return false;
+    agent.reorderQueue(order);
+    return true;
   }
 
   /** Record a session id to resume when this tab next spawns (reload restore). */

@@ -20,17 +20,16 @@ call :clone "ComfyUI-GGUF" "https://github.com/city96/ComfyUI-GGUF"
 call :clone "ComfyUI-VideoHelperSuite" "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
 call :clone "rgthree-comfy" "https://github.com/rgthree/rgthree-comfy"
 call :clone "ComfyUI-Easy-Use" "https://github.com/yolain/ComfyUI-Easy-Use"
-call :clone "was-node-suite-comfyui" "https://github.com/ltdrdata/was-node-suite-comfyui"
 call :clone "ComfyUI_tinyterraNodes" "https://github.com/TinyTerra/ComfyUI_tinyterraNodes"
 call :clone "ComfyUI-Manager" "https://github.com/ltdrdata/ComfyUI-Manager.git"
 
 echo -------- models --------
 call :grab "models\vae\wan_2.1_vae.safetensors" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/wan_2.1_vae.safetensors"
 call :grab "models\text_encoders\umt5-xxl-encoder-Q5_K_S.gguf" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/umt5-xxl-encoder-Q5_K_S.gguf"
-call :grab "models\unet\Wan2.2-I2V-A14B-HighNoise-Q8_0.gguf" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/Wan2.2-I2V-A14B-HighNoise-Q8_0.gguf"
-call :grab "models\unet\Wan2.2-I2V-A14B-LowNoise-Q8_0.gguf" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/Wan2.2-I2V-A14B-LowNoise-Q8_0.gguf"
-call :grab "models\loras\Wan2.2-Lightning_I2V-A14B-4steps-lora_HIGH_fp16.safetensors" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/Wan2.2-Lightning_I2V-A14B-4steps-lora_HIGH_fp16.safetensors"
-call :grab "models\loras\Wan2.2-Lightning_I2V-A14B-4steps-lora_LOW_fp16.safetensors" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/Wan2.2-Lightning_I2V-A14B-4steps-lora_LOW_fp16.safetensors"
+call :grab "models\unet\Wan2.2-I2V-A14B-HighNoise-Q4_K_S.gguf" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/Wan2.2-I2V-A14B-HighNoise-Q4_K_S.gguf"
+call :grab "models\unet\Wan2.2-I2V-A14B-LowNoise-Q4_K_S.gguf" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/Wan2.2-I2V-A14B-LowNoise-Q4_K_S.gguf"
+call :grab "models\loras\wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors" "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"
+call :grab "models\loras\wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors" "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"
 call :grab "models\RMBG\BiRefNet\BiRefNet_toonout.safetensors" "https://huggingface.co/1038lab/BiRefNet/resolve/main/BiRefNet_toonout.safetensors"
 
 echo DONE. Restart ComfyUI, then load workflow.json.

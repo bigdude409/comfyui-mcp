@@ -75,8 +75,19 @@ function hasControlAfterGenerate(
 ): boolean {
   const spec =
     def.input.required?.[inputName] ?? def.input.optional?.[inputName];
-  if (!spec || !spec[1]) return false;
-  return (spec[1] as Record<string, unknown>).control_after_generate === true;
+  if (!spec) return false;
+  if ((spec[1] as Record<string, unknown> | undefined)?.control_after_generate === true)
+    return true;
+  // ComfyUI's frontend auto-adds a control_after_generate widget to seed-type INT
+  // widgets even when object_info doesn't flag it (e.g. UltimateSDUpscale.seed,
+  // KSamplerAdvanced.noise_seed). The saved widgets_values then carry the extra
+  // "fixed"/"randomize"/… value that must be skipped during mapping.
+  if (
+    spec[0] === "INT" &&
+    (inputName === "seed" || inputName === "noise_seed" || inputName === "rand_seed")
+  )
+    return true;
+  return false;
 }
 
 /**
@@ -796,6 +807,21 @@ export function convertUiToApi(
       const spec =
         (def.input?.required as Record<string, unknown>)?.[name] ??
         (def.input?.optional as Record<string, unknown>)?.[name];
+
+      // Classic combo widget: if the saved value isn't one of the valid options
+      // (a stale UI-helper combo like Impact's "Select to add Wildcard", or a
+      // value from a node version with different options), fall back to the
+      // default first option. ComfyUI hard-rejects "Value not in list" otherwise,
+      // so defaulting is strictly safer than passing the stale value through.
+      const comboOpts = Array.isArray(spec) ? spec[0] : undefined;
+      if (
+        Array.isArray(comboOpts) &&
+        comboOpts.length > 0 &&
+        !comboOpts.includes(value as never)
+      ) {
+        inputs[name] = comboOpts[0];
+      }
+
       const opts = (
         Array.isArray(spec)
           ? (spec[1] as { options?: Array<{ key?: unknown; inputs?: { required?: Record<string, unknown> } }> })
@@ -861,6 +887,26 @@ export function convertUiToApi(
       }
     }
 
+    // rgthree "Power Lora Loader" stores its loras in widgets_values as a list of
+    // {on, lora, strength, strengthTwo} objects, NOT as named inputs — its Python
+    // reads them from kwargs keyed lora_1, lora_2, …. Translate them here so the
+    // loras actually apply; otherwise the node loads zero loras (e.g. a 4-step
+    // lightning video workflow then renders badly under-denoised / blurry).
+    if (/Power Lora Loader/.test(classType)) {
+      const wv = Array.isArray(node.widgets_values) ? node.widgets_values : [];
+      let li = 1;
+      for (const w of wv) {
+        if (
+          w &&
+          typeof w === "object" &&
+          !Array.isArray(w) &&
+          "lora" in (w as Record<string, unknown>)
+        ) {
+          inputs[`lora_${li++}`] = w;
+        }
+      }
+    }
+
     // Build the API node
     workflow[nodeId] = {
       class_type: classType,
@@ -899,6 +945,50 @@ export function convertUiToApi(
   }
   if (prunedRefs > 0) {
     warnings.push(`Pruned ${prunedRefs} dangling input reference(s) to nodes not in the prompt.`);
+  }
+
+  // Drop links whose source output type clearly mismatches the consuming input's
+  // expected type. ComfyUI hard-rejects a type-mismatched link ("Return type
+  // mismatch between linked nodes") and fails the whole output branch, so a
+  // mismatch means the link is already broken — dropping it cannot regress a
+  // working graph (which has none). For an optional input the input simply
+  // becomes absent (valid); this rescues e.g. an Impact detailer whose
+  // bbox_detector got mis-resolved onto an IMAGE output by a virtual bus.
+  // Restricted to custom object types (uppercase, non-primitive) so primitive
+  // coercions (INT/FLOAT/…) and wildcard ("*") inputs are never touched.
+  // A "strict" object type is a concrete custom type (IMAGE, MODEL, BBOX_DETECTOR…).
+  // Exclude primitives (coercible) and polymorphic/wildcard types — notably the V3
+  // COMFY_* meta-types (e.g. COMFY_MATCHTYPE_V3, which match whatever they connect
+  // to) and ANY/* — so a valid IMAGE↔COMFY_MATCHTYPE_V3 link is never dropped.
+  const isObjectType = (t: unknown): t is string =>
+    typeof t === "string" &&
+    /^[A-Z][A-Z0-9_]*$/.test(t) &&
+    !t.startsWith("COMFY_") &&
+    !["INT", "FLOAT", "STRING", "BOOLEAN", "NUMBER", "ANY"].includes(t);
+  let droppedMismatch = 0;
+  for (const node of Object.values(workflow)) {
+    const def = objectInfo[node.class_type];
+    if (!def) continue;
+    const ins = node.inputs as Record<string, unknown>;
+    for (const [name, val] of Object.entries(ins)) {
+      if (!Array.isArray(val) || val.length !== 2 || typeof val[0] !== "string") {
+        continue;
+      }
+      const srcDef = objectInfo[workflow[val[0]]?.class_type];
+      const srcOut = srcDef?.output?.[val[1] as number];
+      const inSpec = def.input.required?.[name] ?? def.input.optional?.[name];
+      const expected = Array.isArray(inSpec) ? inSpec[0] : undefined;
+      if (isObjectType(expected) && isObjectType(srcOut) && expected !== srcOut) {
+        if (process.env.DEBUG_PRUNE) {
+          logger.info(`TYPEDROP: ${node.class_type}.${name} expected ${expected} got ${srcOut}`);
+        }
+        delete ins[name];
+        droppedMismatch++;
+      }
+    }
+  }
+  if (droppedMismatch > 0) {
+    warnings.push(`Dropped ${droppedMismatch} type-mismatched link(s).`);
   }
 
   const nodeCount = Object.keys(workflow).length;

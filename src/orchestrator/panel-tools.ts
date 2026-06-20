@@ -33,7 +33,10 @@ function isAffirmative(reply: unknown): boolean {
 }
 
 type ToolResult = {
-  content: Array<{ type: "text"; text: string }>;
+  content: Array<
+    | { type: "text"; text: string }
+    | { type: "image"; data: string; mimeType: string }
+  >;
   isError?: boolean;
 };
 
@@ -66,6 +69,31 @@ export function createPanelMcpServer(
       return ok(await bridge.send(cmd as { cmd: string }, { tabId, timeoutMs }));
     } catch (err) {
       return fail(err);
+    }
+  };
+
+  // Human-in-the-loop confirmation for a DESTRUCTIVE op: render a yes/no card in
+  // the panel and block on the user's pick. Returns false on decline, timeout, or
+  // no panel — so the op is SKIPPED, never performed without an explicit yes.
+  // (We gate inside the tool because the SDK's canUseTool is bypassed under
+  // bypassPermissions, which the panel agent runs in.)
+  const confirm = async (question: string, header: string): Promise<boolean> => {
+    try {
+      const reply = await bridge.send(
+        {
+          cmd: "ask_user",
+          question,
+          header,
+          options: [
+            { label: "Yes, go ahead", description: "" },
+            { label: "No, cancel", description: "" },
+          ],
+        } as { cmd: string },
+        { tabId, timeoutMs: 300000 },
+      );
+      return isAffirmative(reply);
+    } catch {
+      return false;
     }
   };
 
@@ -107,9 +135,19 @@ export function createPanelMcpServer(
       ),
       tool(
         "panel_clear",
-        "Remove EVERY node from the user's open graph in one step — use when they ask to clear/reset the canvas. The whole wipe is a single Ctrl+Z undo.",
+        "Remove EVERY node from the user's open graph — only for an explicit 'clear/reset the canvas'. Just CALL THIS DIRECTLY when they ask to clear: the tool itself pops a confirm card and only wipes on a yes (don't ask separately first). The wipe is a single Ctrl+Z undo. NEVER use this for a 'new workflow' — that's panel_new_workflow (a new tab, leaves this graph intact).",
         {},
-        async () => call({ cmd: "graph_clear" }),
+        async () => {
+          if (
+            !(await confirm(
+              "Clear the canvas? This removes every node from the open workflow. (One Ctrl+Z undoes it.)",
+              "Clear canvas",
+            ))
+          ) {
+            return ok("Cancelled — the canvas was left as-is.");
+          }
+          return call({ cmd: "graph_clear" });
+        },
       ),
       tool(
         "panel_connect",
@@ -491,6 +529,78 @@ export function createPanelMcpServer(
         async (args) => call({ cmd: "graph_create_subgraph", node_ids: args.node_ids }, 15000),
       ),
       tool(
+        "panel_create_group",
+        "Create a labeled GROUP box (the colored rectangle that visually frames a region) on the user's open graph. This is the lightweight organizer, DISTINCT from a subgraph (which nests/hides nodes) — a group just draws a titled box around nodes, leaving them in place. Pass node_ids to auto-size the box around those nodes, or bounds [x, y, width, height] for an explicit box. Optional color (hex like '#3f789e') and title. Returns the new group's id. Undoable with Ctrl+Z.",
+        {
+          title: z.string().optional().describe("Group label shown on the box header."),
+          node_ids: z
+            .array(z.number().int())
+            .optional()
+            .describe("Wrap these nodes — the box is auto-sized (with padding) around them."),
+          bounds: z
+            .tuple([z.number(), z.number(), z.number(), z.number()])
+            .optional()
+            .describe("Explicit [x, y, width, height]. Ignored if node_ids is given."),
+          color: z.string().optional().describe("Box/header color, e.g. '#3f789e'."),
+          font_size: z.number().optional().describe("Title font size (default 24)."),
+        },
+        async (args) =>
+          call(
+            {
+              cmd: "graph_create_group",
+              title: args.title,
+              node_ids: args.node_ids,
+              bounds: args.bounds,
+              color: args.color,
+              font_size: args.font_size,
+            },
+            15000,
+          ),
+      ),
+      tool(
+        "panel_move_group",
+        "Move a group box to a new top-left [x, y] on the user's open graph. By default the nodes inside the group move with it (like dragging the group header); pass move_nodes:false to move only the box. Group id comes from panel_get_graph (the `groups` array) or panel_create_group. Undoable.",
+        {
+          group_id: z.number().int().describe("Group id from panel_get_graph / panel_create_group."),
+          pos: z.tuple([z.number(), z.number()]).describe("New top-left [x, y]."),
+          move_nodes: z.boolean().optional().describe("Move the contained nodes too (default true)."),
+        },
+        async (args) =>
+          call({ cmd: "graph_move_group", group_id: args.group_id, pos: args.pos, move_nodes: args.move_nodes }),
+      ),
+      tool(
+        "panel_edit_group",
+        "Edit a group box: its title, color, font_size, and/or bounds [x, y, width, height]. Only the fields you pass are changed. Undoable.",
+        {
+          group_id: z.number().int().describe("Group id from panel_get_graph / panel_create_group."),
+          title: z.string().optional().describe("New label."),
+          color: z.string().optional().describe("New box/header color, e.g. '#3f789e'."),
+          font_size: z.number().optional().describe("New title font size."),
+          bounds: z
+            .tuple([z.number(), z.number(), z.number(), z.number()])
+            .optional()
+            .describe("Resize/reposition the box: [x, y, width, height]."),
+        },
+        async (args) =>
+          call(
+            {
+              cmd: "graph_edit_group",
+              group_id: args.group_id,
+              title: args.title,
+              color: args.color,
+              font_size: args.font_size,
+              bounds: args.bounds,
+            },
+            15000,
+          ),
+      ),
+      tool(
+        "panel_remove_group",
+        "Remove a group box from the user's open graph. The nodes inside the group are NOT deleted — only the box. Undoable.",
+        { group_id: z.number().int().describe("Group id from panel_get_graph / panel_create_group.") },
+        async (args) => call({ cmd: "graph_remove_group", group_id: args.group_id }, 15000),
+      ),
+      tool(
         "panel_set_node_title",
         "Rename a node's TITLE (the label on its header) — e.g. to label a node by its purpose. Different from panel_set_widget (which changes a value). Undoable with Ctrl+Z.",
         {
@@ -498,6 +608,54 @@ export function createPanelMcpServer(
           title: z.string().describe("New title text."),
         },
         async (args) => call({ cmd: "graph_set_title", node_id: args.node_id, title: args.title }, 15000),
+      ),
+      tool(
+        "panel_set_node_collapsed",
+        "Collapse (minimize) or expand a node on the user's open graph. Collapsed nodes shrink to just their title bar — handy for tidying loaders or rarely-touched nodes. Undoable.",
+        {
+          node_id: z.number().int().describe("Node id from panel_get_graph."),
+          collapsed: z.boolean().optional().describe("true = collapse/minimize (default), false = expand."),
+        },
+        async (args) =>
+          call({ cmd: "graph_set_node_collapsed", node_id: args.node_id, collapsed: args.collapsed }),
+      ),
+      tool(
+        "panel_set_node_color",
+        "Set a node's title-bar and/or body color on the user's open graph. Easiest: pass a `preset` from ComfyUI's palette (red, brown, green, blue, pale_blue, cyan, purple, yellow, black) for matched colors. Or set explicit `color` (title bar) and/or `bgcolor` (body) as hex like '#3f789e'. Pass null for a field to reset it to the theme default. Great for colour-coding stages. Undoable.",
+        {
+          node_id: z.number().int().describe("Node id from panel_get_graph."),
+          preset: z
+            .enum(["red", "brown", "green", "blue", "pale_blue", "cyan", "purple", "yellow", "black"])
+            .optional()
+            .describe("Named LiteGraph color preset (sets both title + body)."),
+          color: z.string().nullable().optional().describe("Title-bar color hex, or null to clear. Ignored if preset given."),
+          bgcolor: z.string().nullable().optional().describe("Body color hex, or null to clear. Ignored if preset given."),
+        },
+        async (args) =>
+          call({
+            cmd: "graph_set_node_color",
+            node_id: args.node_id,
+            preset: args.preset,
+            color: args.color,
+            bgcolor: args.bgcolor,
+          }),
+      ),
+      tool(
+        "panel_screenshot",
+        "Render the workflow the user is currently viewing (root graph, or the open subgraph) to a PNG and return it as an IMAGE so you can SEE the layout. It frames the whole graph (nodes + groups), captures, then restores the user's view. Use this to visually verify a layout you just built — overlaps, alignment, rails, colors, group bands — instead of reasoning from coordinates alone.",
+        { padding: z.number().optional().describe("Margin around the graph in px (default 60).") },
+        async (args) => {
+          try {
+            const res = (await bridge.send({ cmd: "graph_screenshot", padding: args.padding }, { tabId })) as {
+              image?: string;
+              mimeType?: string;
+            };
+            if (!res?.image) return fail("screenshot returned no image");
+            return { content: [{ type: "image", data: res.image, mimeType: res.mimeType ?? "image/png" }] };
+          } catch (err) {
+            return fail(err);
+          }
+        },
       ),
       tool(
         "panel_enter_subgraph",
@@ -510,6 +668,15 @@ export function createPanelMcpServer(
         "Leave the current subgraph and return to the root graph (undo a panel_enter_subgraph). After this, panel_* tools target the root graph again.",
         {},
         async () => call({ cmd: "graph_exit_subgraph" }, 15000),
+      ),
+      tool(
+        "panel_move_rail",
+        "Reposition a subgraph's input or output RAIL (the boundary I/O node that the inner wires connect to). You MUST be INSIDE the subgraph first (panel_enter_subgraph). Read current rail positions from panel_get_graph's `rails` field. Use this to place the input rail just left of the first node column and the output rail just right of the last one, so a tidy interior layout doesn't leave the rails stranded. rail is 'input' or 'output'.",
+        {
+          rail: z.enum(["input", "output"]).describe("Which boundary rail to move."),
+          pos: z.tuple([z.number(), z.number()]).describe("New top-left [x, y]."),
+        },
+        async (args) => call({ cmd: "graph_move_rail", rail: args.rail, pos: args.pos }),
       ),
       tool(
         "panel_promote_widget",
@@ -558,9 +725,19 @@ export function createPanelMcpServer(
       ),
       tool(
         "panel_restart_comfyui",
-        "Restart the user's ComfyUI server via the built-in Manager — needed to load newly installed custom nodes. ComfyUI (and this agent) go down briefly; the panel auto-reconnects and you resume afterward. Tell the user you're restarting before calling. Only call when a restart is actually needed (e.g. right after installing nodes).",
+        "Restart the user's ComfyUI server via the built-in Manager — needed to load newly installed custom nodes. Just CALL THIS DIRECTLY when a restart is needed: the tool itself pops a confirm card and only restarts on a yes (don't ask separately first). ComfyUI and this agent go down briefly, then the panel auto-reconnects and you resume. Only call when a restart is actually needed (e.g. right after installing nodes).",
         {},
-        async () => call({ cmd: "comfy_reboot" }, 15000),
+        async () => {
+          if (
+            !(await confirm(
+              "Restart ComfyUI now? It (and this agent) will go down briefly, then reconnect and resume automatically.",
+              "Restart ComfyUI",
+            ))
+          ) {
+            return ok("Cancelled — ComfyUI was not restarted.");
+          }
+          return call({ cmd: "comfy_reboot" }, 15000);
+        },
       ),
     ],
   });

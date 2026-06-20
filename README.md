@@ -17,7 +17,7 @@ Works on **macOS**, **Linux**, and **Windows**. Auto-detects your ComfyUI instal
 The plugin ships **expert skills that grow with every release** — model-specific generation guides with curated download URLs, workflow recipes, troubleshooting, and custom-node authoring — so Claude knows the right sampler, CFG, resolution, and model files for each architecture without trial and error.
 
 > ### ✅ Now available: the [ComfyUI Agent Panel](https://registry.comfy.org/nodes/comfyui-agent-panel) on ComfyUI-Manager & the Comfy Registry
-> Claude in your ComfyUI sidebar — live graph edits, activity cards, multi-tab, zero API keys.
+> Claude in your ComfyUI sidebar — live graph edits, spatial canvas layout, rewind/rollback, a pending-message tray, activity cards, multi-tab, zero API keys.
 > Search **`comfyui-agent-panel`** in ComfyUI-Manager to install. [Read more →](https://comfyui-mcp.artokun.io/docs/panel)
 
 📖 **Full documentation: [comfyui-mcp.artokun.io/docs](https://comfyui-mcp.artokun.io/docs)**
@@ -128,7 +128,7 @@ This package also ships as a **Claude Code plugin**, providing slash commands, s
 
 ## MCP Tools
 
-47 tools across workflow execution, generation, iteration, composition, models, and more:
+96 tools across workflow execution, generation, iteration, composition, models, and more:
 
 ### Image Generation (high-level)
 
@@ -167,6 +167,9 @@ This package also ships as a **Claude Code plugin**, providing slash commands, s
 | `enqueue_workflow` | Submit a workflow (API format JSON) — returns `prompt_id` immediately, non-blocking |
 | `get_job_status` | Check execution status of a job by prompt ID |
 | `get_queue` | View the current execution queue (running + pending) |
+| `get_queued_workflow` | Inspect the full workflow payload for one pending queue item |
+| `move_queued_job` | Move a pending job to the front/back by requeueing it with a new prompt ID |
+| `edit_queued_job` | Patch or replace a pending queued workflow and requeue it with a new prompt ID |
 | `cancel_job` | Interrupt the currently running job |
 | `get_system_stats` | Get system info — GPU, VRAM, Python version, OS |
 
@@ -214,6 +217,9 @@ This package also ships as a **Claude Code plugin**, providing slash commands, s
 | `search_models` | Search HuggingFace for compatible models (checkpoints, LoRAs, VAEs, etc.) |
 | `download_model` | Download a model from a URL to the correct ComfyUI subdirectory |
 | `list_local_models` | List installed models by type: checkpoints, loras, vae, upscale_models, controlnet, embeddings, clip, unet, diffusion_models, text_encoders |
+| `list_extra_paths` | View standalone or Desktop ComfyUI extra search-path config |
+| `add_extra_path` | Add a model/custom_nodes search path to the extra paths YAML |
+| `remove_extra_path` | Remove a stored extra search path from the extra paths YAML |
 
 ### Memory Management
 
