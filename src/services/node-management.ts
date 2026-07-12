@@ -417,7 +417,7 @@ async function queueManagerTask(
 }
 
 // ---------------------------------------------------------------------------
-// cm-cli subprocess helper
+// Official comfy-cli subprocess helper
 // ---------------------------------------------------------------------------
 
 const COMFY_CLI_TIMEOUT = 600_000;
@@ -440,33 +440,8 @@ export function nonInteractiveGitEnv(): NodeJS.ProcessEnv {
   };
 }
 
-function resolveCmCliPath(): string {
-  if (!config.comfyuiPath) {
-    throw new ProcessControlError(
-      "This operation requires a local ComfyUI install, but config.comfyuiPath " +
-        "is not set (running in remote --comfyui-url mode). Set COMFYUI_PATH or " +
-        "use the ComfyUI-Manager HTTP API instead.",
-    );
-  }
-  const cmCli = join(
-    config.comfyuiPath,
-    "custom_nodes",
-    "ComfyUI-Manager",
-    "cm-cli.py",
-  );
-  if (!existsSync(cmCli)) {
-    throw new NodeManagementError(
-      `cm-cli.py not found at ${cmCli}. Modern ComfyUI-Manager ships as the pip ` +
-        `package 'comfyui_manager' (no cm-cli.py), so the subprocess fallback is ` +
-        `unavailable on this install. Retry without useCmCli — the HTTP API covers ` +
-        `install/update/fix/uninstall/enable/disable.`,
-    );
-  }
-  return cmCli;
-}
-
 /**
- * Run a cm-cli.py subcommand. Returns combined stdout.
+ * Run an official `comfy node` subcommand. Returns normalized JSON data.
  * Throws ProcessControlError if comfyuiPath is undefined (remote mode).
  */
 function runCmCli(args: string[]): string {
@@ -923,7 +898,7 @@ export interface InstallOptions {
   ref?: string;
   mode?: ManagerMode;
   channel?: string;
-  /** Force the cm-cli subprocess instead of the HTTP API. */
+  /** Force the official comfy-cli subprocess instead of the HTTP API. */
   useCmCli?: boolean;
 }
 
@@ -961,7 +936,7 @@ export async function installCustomNode(
     }
     return {
       mechanism: "comfy-cli",
-      message: `Installed "${id}" via cm-cli.`,
+      message: `Installed "${id}" via official comfy-cli.`,
       details: out.trim(),
     };
   }
@@ -1070,8 +1045,8 @@ export async function updateCustomNode(
     return {
       mechanism: "comfy-cli",
       message: all
-        ? "Updated all installed node packs via cm-cli."
-        : `Updated "${id}" via cm-cli.`,
+        ? "Updated all installed node packs via official comfy-cli."
+        : `Updated "${id}" via official comfy-cli.`,
       details: out.trim(),
     };
   }
@@ -1134,7 +1109,7 @@ export async function reinstallCustomNode(
     const out = runCmCli(["reinstall", id, "--mode", mode, "--channel", channel]);
     return {
       mechanism: "comfy-cli",
-      message: `Reinstalled "${id}" via cm-cli.`,
+      message: `Reinstalled "${id}" via official comfy-cli.`,
       details: out.trim(),
     };
   }
@@ -1178,8 +1153,8 @@ export async function fixCustomNode(opts: FixOptions): Promise<NodeOpResult> {
     return {
       mechanism: "comfy-cli",
       message: all
-        ? "Repaired all installed node packs via cm-cli."
-        : `Repaired "${id}" via cm-cli.`,
+        ? "Repaired all installed node packs via official comfy-cli."
+        : `Repaired "${id}" via official comfy-cli.`,
       details: out.trim(),
     };
   }
@@ -1251,7 +1226,7 @@ export async function syncNodeDependencies(): Promise<SyncDepsResult> {
   return {
     mechanism: "comfy-cli",
     message:
-      "Reconciled installed-node Python dependencies via cm-cli restore-dependencies.",
+      "Reconciled installed-node Python dependencies via official comfy-cli node restore-dependencies.",
     details: out.trim(),
   };
 }

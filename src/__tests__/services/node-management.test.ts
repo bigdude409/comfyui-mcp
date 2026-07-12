@@ -34,6 +34,11 @@ vi.mock("../../config.js", () => {
 // Mock child_process for the cm-cli subprocess paths.
 vi.mock("node:child_process", () => ({
   execFileSync: vi.fn(),
+  spawnSync: vi.fn(() => ({
+    status: 0,
+    stdout: JSON.stringify({ schema: "envelope/1", type: "envelope", ok: true, command: "version", version: "1.11.1", where: null, data: {}, error: null }),
+    stderr: "",
+  })),
 }));
 
 // Mock fs so resolveCmCliPath's existsSync check is controllable.
@@ -68,7 +73,7 @@ const mockedExists = vi.mocked(existsSync);
 // same way instead of hardcoding POSIX paths.
 const COMFY = "/fake/comfy";
 const COMFY_CLI = join(COMFY, ".venv", process.platform === "win32" ? "Scripts" : "bin", process.platform === "win32" ? "comfy.exe" : "comfy");
-const cliEnvelope = (data: unknown) => JSON.stringify({ ok: true, command: "node", version: "1.11.1", where: "local", data, error: null });
+const cliEnvelope = (data: unknown) => JSON.stringify({ schema: "envelope/1", type: "envelope", ok: true, command: "node", version: "1.11.1", where: "local", data, error: null });
 // runGitCheckout now resolves the target with path.resolve (containment check),
 // so the -C dir carries the drive letter on Windows — match it.
 const BAR_DIR = resolve(COMFY, "custom_nodes", "bar");

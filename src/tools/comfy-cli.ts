@@ -1,7 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
-  assertComfyCliOk,
   getComfyCliVersion,
   resolveComfyCliExecutable,
   runComfyCli,
@@ -12,11 +11,15 @@ const whereSchema = z.enum(["local", "cloud"]).optional();
 const workspaceSchema = z.string().optional().describe("Optional ComfyUI workspace override. Otherwise COMFYUI_PATH/auto-detection is used.");
 
 function textEnvelope(envelope: unknown) {
-  return { content: [{ type: "text" as const, text: JSON.stringify(envelope, null, 2) }] };
+  const failed = typeof envelope === "object" && envelope !== null && "ok" in envelope && envelope.ok === false;
+  return {
+    ...(failed ? { isError: true } : {}),
+    content: [{ type: "text" as const, text: JSON.stringify(envelope, null, 2) }],
+  };
 }
 
-async function call(args: string[], options: { workspace?: string; where?: "local" | "cloud"; timeoutMs?: number }) {
-  return textEnvelope(assertComfyCliOk(await runComfyCli(args, options)));
+async function call(args: string[], options: { workspace?: string; where?: "local" | "cloud"; timeoutMs?: number; cwd?: string }) {
+  return textEnvelope(await runComfyCli(args, options));
 }
 
 export function registerComfyCliTools(server: McpServer): void {
@@ -30,7 +33,7 @@ export function registerComfyCliTools(server: McpServer): void {
     async (args) => {
       try {
         if (args.detail === "version") {
-          return textEnvelope({ executable: resolveComfyCliExecutable({ workspace: args.workspace }), version: getComfyCliVersion() });
+          return textEnvelope({ executable: resolveComfyCliExecutable({ workspace: args.workspace }), version: getComfyCliVersion({ workspace: args.workspace }) });
         }
         return await call([args.detail], { workspace: args.workspace, timeoutMs: 30_000 });
       } catch (error) {
@@ -50,12 +53,13 @@ export function registerComfyCliTools(server: McpServer): void {
     async (args) => {
       try {
         const options = { workspace: args.workspace, timeoutMs: 120_000 };
-        let stopped: unknown;
-        if (args.action !== "start") stopped = assertComfyCliOk(await runComfyCli(["stop"], options));
+        let stopped: Awaited<ReturnType<typeof runComfyCli>> | undefined;
+        if (args.action !== "start") stopped = await runComfyCli(["stop"], options);
         if (args.action === "stop") return textEnvelope(stopped);
+        if (stopped && !stopped.ok) return textEnvelope(stopped);
         const launch = ["launch", "--background"];
         if (args.launchArgs?.length) launch.push("--", ...args.launchArgs);
-        const started = assertComfyCliOk(await runComfyCli(launch, options));
+        const started = await runComfyCli(launch, options);
         return textEnvelope(args.action === "restart" ? { stopped, started } : started);
       } catch (error) {
         return errorToToolResult(error);
@@ -177,20 +181,23 @@ export function registerComfyCliTools(server: McpServer): void {
 
   server.tool(
     "comfy_cli_models",
-    "Discover model folders/files through official comfy-cli locally or in Comfy Cloud. Search is filename-based locally and uses the enriched cloud asset catalog remotely.",
+    "Discover model folders/files locally or in Comfy Cloud, download model URLs into a workspace, or remove workspace model files through official comfy-cli.",
     {
-      action: z.enum(["list-folders", "list-folder", "search", "show"]),
+      action: z.enum(["list-folders", "list-folder", "search", "show", "download", "remove"]),
       folder: z.string().optional(),
       text: z.string().optional(),
       type: z.string().optional(),
       name: z.string().optional(),
+      url: z.string().url().optional(),
+      relativePath: z.string().optional().describe("Workspace-relative model directory (default models/checkpoints)."),
+      modelNames: z.array(z.string()).optional().describe("Model filenames to remove."),
       limit: z.number().int().min(1).max(100).optional(),
       where: whereSchema,
       workspace: workspaceSchema,
     },
     async (args) => {
       try {
-        const command = ["models", args.action];
+        const command = [args.action === "download" || args.action === "remove" ? "model" : "models", args.action];
         if (args.action === "list-folder") {
           if (!args.folder) throw new Error("folder is required for list-folder");
           command.push(args.folder);
@@ -202,6 +209,16 @@ export function registerComfyCliTools(server: McpServer): void {
         if (args.action === "search") {
           if (args.text) command.push("--text", args.text);
           if (args.type) command.push("--type", args.type);
+        }
+        if (args.action === "download") {
+          if (!args.url) throw new Error("url is required for model download");
+          command.push("--url", args.url);
+          if (args.relativePath) command.push("--relative-path", args.relativePath);
+        }
+        if (args.action === "remove") {
+          if (!args.modelNames?.length) throw new Error("modelNames is required for model remove");
+          if (args.relativePath) command.push("--relative-path", args.relativePath);
+          command.push("--model-names", args.modelNames.join(" "));
         }
         if (args.limit && args.action !== "show" && args.action !== "list-folders") command.push("--limit", String(args.limit));
         return await call(command, { workspace: args.workspace, where: args.where, timeoutMs: 60_000 });
@@ -219,6 +236,7 @@ export function registerComfyCliTools(server: McpServer): void {
       name: z.string().optional(),
       path: z.string().optional(),
       scope: z.enum(["user", "project"]).optional(),
+      projectDir: z.string().optional().describe("Working directory for project-scoped skill operations. Required when scope='project'."),
       targets: z.array(z.string()).optional(),
       skills: z.array(z.string()).optional(),
       apply: z.boolean().optional().default(false),
@@ -227,6 +245,9 @@ export function registerComfyCliTools(server: McpServer): void {
     async (args) => {
       try {
         const command = ["skills", args.action];
+        if (args.scope === "project" && !args.projectDir) {
+          throw new Error("projectDir is required when scope='project'");
+        }
         if (args.action === "show" && args.name) command.push(args.name);
         if (args.action === "validate") {
           if (!args.path) throw new Error("path is required for skills validate");
@@ -238,7 +259,7 @@ export function registerComfyCliTools(server: McpServer): void {
           for (const skill of args.skills ?? []) command.push("--skill", skill);
           if (!args.apply) command.push("--dry-run");
         }
-        return await call(command, { workspace: args.workspace, timeoutMs: 60_000 });
+        return await call(command, { workspace: args.workspace, timeoutMs: 60_000, cwd: args.projectDir });
       } catch (error) {
         return errorToToolResult(error);
       }

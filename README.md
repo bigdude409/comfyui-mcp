@@ -348,7 +348,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 ### Official comfy-cli
 
-Install [comfy-cli](https://docs.comfy.org/comfy-cli/getting-started#install-cli) 1.11.1 or newer to enable the official JSON-backed tools. The MCP resolves `comfy` from `COMFY_CLI_PATH`, `PATH`, or the selected workspace's `.venv`/`venv`. Local custom-node CLI operations use `comfy node`; remote targets retain the ComfyUI-Manager HTTP path.
+Install [comfy-cli](https://docs.comfy.org/comfy-cli/getting-started#install-cli) 1.11.1 or newer to enable the official JSON-backed tools. The MCP resolves `comfy` from `COMFY_CLI_PATH`, `PATH`, or the selected workspace's `.venv`/`venv`. Local custom-node operations prefer `comfy node` when a supported CLI is available and otherwise fall back to Manager HTTP; remote targets retain Manager HTTP.
 
 | Tool | Description |
 |------|-------------|
@@ -357,7 +357,7 @@ Install [comfy-cli](https://docs.comfy.org/comfy-cli/getting-started#install-cli
 | `comfy_cli_jobs` | List, inspect, wait for, watch, or cancel local/cloud jobs |
 | `comfy_cli_workflow` | Validate or run workflow files through the official CLI |
 | `comfy_cli_transfer` | Upload inputs or download completed job outputs |
-| `comfy_cli_models` | Browse/search local model files or the cloud asset catalog |
+| `comfy_cli_models` | Browse/search local or cloud models; download/remove workspace model files |
 | `comfy_cli_skills` | List/show/validate/install/status/uninstall official bundled agent skills |
 
 ### Diagnostics
