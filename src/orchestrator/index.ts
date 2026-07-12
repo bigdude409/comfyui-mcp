@@ -1369,6 +1369,11 @@ export async function runPanelOrchestrator(): Promise<void> {
     onThinking: (key, tokens) => {
       bridge.push({ type: "thinking", tokens }, panelTabOf(key));
     },
+    // Tool the agent invoked → a compact "activity" line for canvas-less clients
+    // (mobile), so watching the agent work isn't just a spinner.
+    onToolCall: (key, name) => {
+      bridge.push({ type: "action", name }, panelTabOf(key));
+    },
     // The agent dequeued a message (the true "read" moment) → flip that bubble
     // from queued/muted to read.
     onSeen: (key, mid) => {

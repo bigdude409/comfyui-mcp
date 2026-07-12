@@ -143,6 +143,8 @@ export interface PanelAgentDeps {
   onTurn?: (tabId: string, state: "working" | "done") => void;
   /** Live extended-thinking token count, for a "thinking… (N)" indicator. */
   onThinking?: (tabId: string, tokens: number) => void;
+  /** A tool the agent invoked — for a compact "activity" line (tool visibility). */
+  onToolCall?: (tabId: string, name: string) => void;
   /** Fired when the agent DEQUEUES a message and starts processing it (the true
    *  "read" moment) — carries the client mid so the panel can flip that bubble
    *  from queued/muted to read. */
@@ -870,6 +872,17 @@ export class PanelAgent {
         }
         break;
       }
+      case "tool_call": {
+        // Tool visibility — surface the agent's actions (a canvas-less mobile
+        // client otherwise sees only a spinner between reply bubbles). Only the
+        // START phase is forwarded as a compact activity line.
+        this.busy = true;
+        this.deps.onTurn?.(this.tabId, "working");
+        if (ev.phase === "start") {
+          this.deps.onToolCall?.(this.tabId, ev.name);
+        }
+        break;
+      }
       case "result": {
         // Cache the context window + cost from the result, then re-report using
         // the last assistant usage (the true current context).
@@ -941,6 +954,8 @@ export interface PanelAgentManagerOptions {
   onTurn?: (tabId: string, state: "working" | "done") => void;
   /** Live extended-thinking token count, for a "thinking… (N)" indicator. */
   onThinking?: (tabId: string, tokens: number) => void;
+  /** A tool the agent invoked — for a compact "activity" line (tool visibility). */
+  onToolCall?: (tabId: string, name: string) => void;
   /** Fired when the agent dequeues a message (read moment) — carries the mid. */
   onSeen?: (tabId: string, mid: string) => void;
   /** Build the per-tab live-graph MCP server (bound to the tab id). May return
