@@ -1065,6 +1065,7 @@ export class PanelAgentManager {
         if (state === "done") this.applyPendingRestarts(id);
       },
       onThinking: this.opts.onThinking,
+      onToolCall: this.opts.onToolCall,
       onSeen: this.opts.onSeen,
       panelServer: this.opts.makePanelServer?.(tabId),
       pluginPath: this.opts.pluginPath,
