@@ -21,6 +21,8 @@ import { setupSecureBridge, type SecureBridge } from "../services/secure-bridge.
 import { startQuickTunnel } from "../services/tunnel.js";
 import { detectInstallMode } from "../services/self-update.js";
 import { SessionStore } from "./session-store.js";
+import { listSessions, loadTranscript } from "./history.js";
+import { uploadImageHttp } from "../comfyui/client.js";
 import { logger } from "../utils/logger.js";
 import {
   PanelAgentManager,
@@ -1507,6 +1509,11 @@ export async function runPanelOrchestrator(): Promise<void> {
     onThinking: (key, tokens) => {
       bridge.push({ type: "thinking", tokens }, panelTabOf(key));
     },
+    // Tool the agent invoked → a compact "activity" line for canvas-less clients
+    // (mobile), so watching the agent work isn't just a spinner.
+    onToolCall: (key, name) => {
+      bridge.push({ type: "action", name }, panelTabOf(key));
+    },
     // The agent dequeued a message (the true "read" moment) → flip that bubble
     // from queued/muted to read.
     onSeen: (key, mid) => {
@@ -2634,6 +2641,88 @@ export async function runPanelOrchestrator(): Promise<void> {
       manager.reset(key);
       if (sid) manager.setResume(key, sid);
       bridge.push({ type: "ack", ok: true, kind: "resume_session" }, tabId);
+      return;
+    }
+
+    // Chat-history parity (mobile): list the agent's saved conversations — the
+    // SAME transcripts the desktop panel drives, since both share this
+    // orchestrator's cwd. cid-correlated request/reply, like call_tool.
+    if (event.type === "list_history" && event.tab_id) {
+      const tabId = event.tab_id;
+      const cid = typeof (event as { cid?: unknown }).cid === "string"
+        ? (event as { cid?: string }).cid
+        : undefined;
+      void listSessions(process.cwd())
+        .then((sessions) =>
+          bridge.push({ type: "history_list", cid, sessions }, tabId))
+        .catch((err) => {
+          logger.warn(`[panel-orchestrator] list_history failed: ${err}`);
+          bridge.push(
+            { type: "history_list", cid, sessions: [], error: String(err) },
+            tabId,
+          );
+        });
+      return;
+    }
+
+    // Load one saved conversation's transcript for display (does NOT resume it —
+    // the client sends resume_session next to continue it).
+    if (event.type === "load_history" && event.tab_id) {
+      const tabId = event.tab_id;
+      const cid = typeof (event as { cid?: unknown }).cid === "string"
+        ? (event as { cid?: string }).cid
+        : undefined;
+      const sid = typeof event.session_id === "string" ? event.session_id : "";
+      void loadTranscript(process.cwd(), sid)
+        .then((messages) =>
+          bridge.push(
+            { type: "history_transcript", cid, session_id: sid, messages },
+            tabId,
+          ))
+        .catch((err) => {
+          logger.warn(`[panel-orchestrator] load_history failed: ${err}`);
+          bridge.push(
+            { type: "history_transcript", cid, session_id: sid, messages: [], error: String(err) },
+            tabId,
+          );
+        });
+      return;
+    }
+
+    // Media upload from the mobile client: the phone sends image/video bytes
+    // (base64) to stage as a ComfyUI INPUT (LoadImage / VHS_LoadVideo), since the
+    // phone can't reach the rig's filesystem. Decode → POST to ComfyUI's
+    // /upload/image → reply with the stored input filename the agent can use.
+    if (event.type === "upload_media" && event.tab_id) {
+      const tabId = event.tab_id;
+      const ev = event as {
+        cid?: unknown;
+        filename?: unknown;
+        mime?: unknown;
+        data_base64?: unknown;
+      };
+      const cid = typeof ev.cid === "string" ? ev.cid : undefined;
+      const filename = typeof ev.filename === "string" ? ev.filename : "upload";
+      const mime = typeof ev.mime === "string" ? ev.mime : "image/png";
+      const b64 = typeof ev.data_base64 === "string" ? ev.data_base64 : "";
+      void (async () => {
+        try {
+          if (!b64) throw new Error("no data");
+          const buf = Buffer.from(b64, "base64");
+          const res = await uploadImageHttp(filename, buf, mime);
+          bridge.push(
+            { type: "media_uploaded", cid, ok: true, name: res.name, kind: mime.startsWith("video") ? "video" : "image" },
+            tabId,
+          );
+          logger.info(`[panel-orchestrator] upload_media → ${res.name} (${buf.length}B, tab ${tabId.slice(0, 8)})`);
+        } catch (err) {
+          logger.warn(`[panel-orchestrator] upload_media failed: ${err}`);
+          bridge.push(
+            { type: "media_uploaded", cid, ok: false, error: err instanceof Error ? err.message : String(err) },
+            tabId,
+          );
+        }
+      })();
       return;
     }
 

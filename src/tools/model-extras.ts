@@ -302,6 +302,24 @@ export function registerModelExtrasTools(server: McpServer): void {
           }
         }
 
+        // Write usage-docs sidecars beside the file so the panel agent has the
+        // description, trigger words, and example generation params on hand.
+        // Local-only: remote mode has no local FS (savedPath is a status string).
+        if (isLocalMode() && resolved.metadata) {
+          const sidecar = await writeCivitaiSidecar(savedPath, resolved.metadata);
+          if (sidecar) {
+            const tw = resolved.metadata.trainedWords;
+            if (tw.length) lines.push(`  Trigger words: ${tw.join(", ")}`);
+            const recipes = resolved.metadata.examples.filter(
+              (e) => e.meta && Object.keys(e.meta).length > 0,
+            ).length;
+            lines.push(
+              `  Metadata: ${sidecar.md}` +
+                (recipes ? ` (${recipes} example recipe${recipes === 1 ? "" : "s"})` : ""),
+            );
+          }
+        }
+
         return {
           content: [{ type: "text" as const, text: lines.join("\n") }],
         };
