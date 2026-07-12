@@ -21,6 +21,7 @@ import { setupSecureBridge, type SecureBridge } from "../services/secure-bridge.
 import { startQuickTunnel } from "../services/tunnel.js";
 import { detectInstallMode } from "../services/self-update.js";
 import { SessionStore } from "./session-store.js";
+import { listSessions, loadTranscript } from "./history.js";
 import { logger } from "../utils/logger.js";
 import {
   PanelAgentManager,
@@ -2342,6 +2343,51 @@ export async function runPanelOrchestrator(): Promise<void> {
       manager.reset(key);
       if (sid) manager.setResume(key, sid);
       bridge.push({ type: "ack", ok: true, kind: "resume_session" }, tabId);
+      return;
+    }
+
+    // Chat-history parity (mobile): list the agent's saved conversations — the
+    // SAME transcripts the desktop panel drives, since both share this
+    // orchestrator's cwd. cid-correlated request/reply, like call_tool.
+    if (event.type === "list_history" && event.tab_id) {
+      const tabId = event.tab_id;
+      const cid = typeof (event as { cid?: unknown }).cid === "string"
+        ? (event as { cid?: string }).cid
+        : undefined;
+      void listSessions(process.cwd())
+        .then((sessions) =>
+          bridge.push({ type: "history_list", cid, sessions }, tabId))
+        .catch((err) => {
+          logger.warn(`[panel-orchestrator] list_history failed: ${err}`);
+          bridge.push(
+            { type: "history_list", cid, sessions: [], error: String(err) },
+            tabId,
+          );
+        });
+      return;
+    }
+
+    // Load one saved conversation's transcript for display (does NOT resume it —
+    // the client sends resume_session next to continue it).
+    if (event.type === "load_history" && event.tab_id) {
+      const tabId = event.tab_id;
+      const cid = typeof (event as { cid?: unknown }).cid === "string"
+        ? (event as { cid?: string }).cid
+        : undefined;
+      const sid = typeof event.session_id === "string" ? event.session_id : "";
+      void loadTranscript(process.cwd(), sid)
+        .then((messages) =>
+          bridge.push(
+            { type: "history_transcript", cid, session_id: sid, messages },
+            tabId,
+          ))
+        .catch((err) => {
+          logger.warn(`[panel-orchestrator] load_history failed: ${err}`);
+          bridge.push(
+            { type: "history_transcript", cid, session_id: sid, messages: [], error: String(err) },
+            tabId,
+          );
+        });
       return;
     }
 
